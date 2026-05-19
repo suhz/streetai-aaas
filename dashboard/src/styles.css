@@ -40,6 +40,9 @@
   --sidebar-hover: #34203a;
   --sidebar-active: #432a48;
   --sidebar-accent: #e08fc8;
+  /* "New since last visit" highlight in the transactions list. Pink so it
+     stands out from the (often teal/grey) accent and from status badges. */
+  --highlight-new: #ec4899;
 }
 
 :root[data-theme="light"] {
@@ -80,6 +83,7 @@
   --sidebar-hover: #34203a;
   --sidebar-active: #432a48;
   --sidebar-accent: #e08fc8;
+  --highlight-new: #db2777;
 }
 
 :root[data-theme="light"] .sidebar {
@@ -386,6 +390,47 @@ a:hover { color: var(--text); }
 
 .table tr:hover td {
   background: var(--bg-card-hover);
+}
+
+/* Highlight applied to transactions added since the user's last visit to the
+   Transactions tab. Designed to be unmistakable but not noisy:
+   - Accent-tinted background row
+   - Thick gradient bar on the left edge (pulses gently to draw the eye)
+   - Slightly bolder text on the first cell
+   The accent fades when the user opens that row's detail page or revisits
+   the tab on a later mount. */
+.table tr.txn-row-new td {
+  background: color-mix(in srgb, var(--highlight-new) 14%, transparent);
+}
+.table tr.txn-row-new:hover td {
+  background: color-mix(in srgb, var(--highlight-new) 22%, var(--bg-card-hover));
+}
+.table tr.txn-row-new td:first-child {
+  box-shadow: inset 5px 0 0 0 var(--highlight-new);
+  position: relative;
+  font-weight: 600;
+  color: var(--text);
+  animation: txn-new-pulse 2.4s ease-in-out infinite;
+}
+
+@keyframes txn-new-pulse {
+  0%, 100% { box-shadow: inset 5px 0 0 0 var(--highlight-new); }
+  50%      { box-shadow: inset 5px 0 0 0 color-mix(in srgb, var(--highlight-new) 55%, transparent); }
+}
+
+/* "NEW" pill rendered inline with the # cell when a row is highlighted */
+.txn-new-pill {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  border-radius: 999px;
+  background: var(--highlight-new);
+  color: white;
+  vertical-align: middle;
+  line-height: 1.4;
 }
 
 /* ═══ Status badges ═══ */

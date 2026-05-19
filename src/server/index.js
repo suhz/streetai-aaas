@@ -2,12 +2,50 @@ import express from 'express';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { spawn } from 'child_process';
 import chalk from 'chalk';
 import { apiRouter } from './api.js';
 import { hubRouter } from './hub.js';
 import { getValidWorkspaces } from '../utils/registry.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+/**
+ * Open a URL in the user's default browser as a fully-detached child process.
+ *
+ * We avoid the `open` npm package for the EADDRINUSE re-launch case because
+ * its child can be killed mid-spawn when the parent calls process.exit very
+ * shortly after — especially on Windows, where the spawn shells out to `cmd
+ * /c start` and inherits stdio handles from the parent unless explicitly
+ * detached. This helper uses platform-native commands with `detached: true`,
+ * `stdio: 'ignore'`, and `unref()` so the child survives parent exit.
+ */
+function openBrowserDetached(url) {
+  try {
+    let cmd, args;
+    if (process.platform === 'win32') {
+      // The empty "" after `start` is the title argument — required when the
+      // URL is quoted, otherwise Windows interprets the URL as the title.
+      cmd = 'cmd';
+      args = ['/c', 'start', '""', url];
+    } else if (process.platform === 'darwin') {
+      cmd = 'open';
+      args = [url];
+    } else {
+      cmd = 'xdg-open';
+      args = [url];
+    }
+    const child = spawn(cmd, args, {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    child.on('error', () => { /* swallow — best-effort */ });
+    child.unref();
+  } catch {
+    // Best-effort — if even spawn fails, we don't want to crash the CLI.
+  }
+}
 
 export async function startServer(workspace, port, hubDir, openPath = '/') {
   const app = express();
@@ -29,6 +67,14 @@ export async function startServer(workspace, port, hubDir, openPath = '/') {
   // Always hub mode
   app.get('/api/mode', (req, res) => {
     res.json({ mode: 'hub' });
+  });
+
+  // Health / fingerprint endpoint. Used by `aaas dashboard` to detect when
+  // a previous dashboard is already running on the target port — the CLI
+  // probes here, and if it sees the AaaS signature it opens the browser
+  // and exits cleanly instead of failing on EADDRINUSE.
+  app.get('/api/health', (req, res) => {
+    res.json({ ok: true, service: 'aaas-dashboard' });
   });
 
   // Hub API
@@ -87,12 +133,72 @@ export async function startServer(workspace, port, hubDir, openPath = '/') {
     res.sendFile(path.join(dashboardDist, 'index.html'));
   });
 
-  app.listen(port, () => {
-    const url = `http://localhost:${port}`;
-    console.log(chalk.green(`  Dashboard running at ${chalk.bold(url)}\n`));
+  const url = `http://localhost:${port}`;
+  const openUrl = openPath !== '/' ? `${url}${openPath}` : url;
 
-    // Try to open browser (openPath navigates directly to the workspace if launched from one)
-    const openUrl = openPath !== '/' ? `${url}${openPath}` : url;
-    import('open').then(mod => mod.default(openUrl)).catch(() => {});
+  const server = app.listen(port, () => {
+    console.log(chalk.green(`  Dashboard running at ${chalk.bold(url)}\n`));
+    openBrowserDetached(openUrl);
   });
+
+  // If the port is already taken, check whether it's our own dashboard. If
+  // so, just open the browser to the running instance and exit cleanly —
+  // this is the normal case when a user clicks the desktop shortcut twice.
+  // If it's some other process, surface a clear error instead of crashing.
+  server.on('error', async (err) => {
+    if (err && err.code === 'EADDRINUSE') {
+      const running = await isOurDashboardRunning(port);
+      if (running) {
+        console.log(chalk.green(`  Dashboard already running at ${chalk.bold(url)} — opening browser.\n`));
+        openBrowserDetached(openUrl);
+        // Give the spawned child a beat to fully detach before we exit.
+        // openBrowserDetached uses detached + ignored stdio + unref(), so the
+        // child should survive parent exit on its own — the small delay is
+        // belt-and-suspenders for slow systems where the OS scheduler hasn't
+        // run the child's first instruction yet.
+        await new Promise(r => setTimeout(r, 300));
+        process.exit(0);
+      }
+      console.error(chalk.red(`\n  Port ${port} is in use by another process.`));
+      console.error(chalk.gray(`  Either stop that process or pass a different port: aaas dashboard --port <N>\n`));
+      process.exit(1);
+    }
+    throw err;
+  });
+}
+
+/**
+ * Probe a localhost port to see if an AaaS dashboard is running there.
+ *
+ * Tries the dedicated `/api/health` fingerprint first (added when EADDRINUSE
+ * handling was introduced). Falls back to `/api/mode` returning the AaaS
+ * `{ mode: 'hub' }` shape — this matters for users whose existing dashboard
+ * was started before `/api/health` shipped: without the fallback, the new
+ * CLI would treat them as a foreign process and refuse to open the browser.
+ *
+ * Both probes time out fast (1.5s) so a hung process on the port doesn't
+ * stall the CLI.
+ */
+async function isOurDashboardRunning(port) {
+  const base = `http://localhost:${port}`;
+
+  const probe = async (path, predicate) => {
+    try {
+      const controller = new AbortController();
+      const t = setTimeout(() => controller.abort(), 1500);
+      const res = await fetch(`${base}${path}`, { signal: controller.signal });
+      clearTimeout(t);
+      if (!res.ok) return false;
+      const body = await res.json();
+      return predicate(body);
+    } catch {
+      return false;
+    }
+  };
+
+  // 1) New endpoint, exact signature.
+  if (await probe('/api/health', b => b && b.service === 'aaas-dashboard')) return true;
+  // 2) Fallback for dashboards that predate /api/health.
+  if (await probe('/api/mode', b => b && b.mode === 'hub')) return true;
+  return false;
 }

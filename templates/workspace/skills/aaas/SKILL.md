@@ -51,18 +51,23 @@ List every service you can perform. For each one, define what it is, what you ne
 
 [Declare the fields you capture for every transaction and how the dashboard
 should render them. The agent reads this block on every skill save and
-reconciles `.aaas/transaction_view.json` from it. Each line is one field:
+reconciles `.aaas/transaction_view.json` from it. `create_transaction` and
+`update_transaction` accept these fields as top-level arguments, and any
+field marked `required` becomes mandatory at the tool-call level.
 
-- `field_key (type, column) — Display Label`
+Each line is one field:
+
+- `field_key (type, required, column) — Display Label`
 - `type` (optional): currency, percentage, rating, date, datetime, boolean, list, text, number
+- `required` (optional flag): the agent MUST populate this field when creating a transaction
 - `column` (optional flag): mark the field as a main-table column
 - `Display Label` (optional): override the prettified key in the dashboard
 
 Replace the examples below with the fields your service actually captures.]
 
-- service (column) — Service
+- service (required, column) — Service
 - status (column) — Status
-- cost (currency, column) — Cost
+- cost (currency, required, column) — Cost
 - created_at (datetime) — Created
 
 ---

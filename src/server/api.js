@@ -6,6 +6,7 @@ import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import multer from 'multer';
 import { getWorkspacePaths, readJson, readText, writeJson, listFiles, fileStats, formatBytes } from '../utils/workspace.js';
+import { validateStatusTransition, TXN_STATUSES } from '../engine/tools/transactions.js';
 import { getProviderCredential, setProviderCredential, removeProviderCredential, listProviders, maskApiKey } from '../auth/credentials.js';
 import { listConnections, loadConnection, saveConnection, removeConnection } from '../auth/connections.js';
 import { AgentEngine } from '../engine/index.js';
@@ -341,11 +342,50 @@ export function apiRouter(workspace) {
   // ─── Transactions ────────────────────────────────
 
   router.get('/transactions', (req, res) => {
-    const includeArchived = req.query.all === 'true';
+    // Three modes:
+    //   default       → active only (archived filtered out)
+    //   ?archived=true → archived only
+    //   ?all=true      → both (used internally by /stats)
+    const archivedOnly = req.query.archived === 'true';
+    const includeArchived = archivedOnly || req.query.all === 'true';
     const status = req.query.status;
     let txns = loadAllTransactions(paths, includeArchived);
+    if (archivedOnly) txns = txns.filter(t => t.archived === true);
     if (status) txns = txns.filter(t => t.status === status);
     res.json(txns);
+  });
+
+  // Lightweight count endpoint for the sidebar "unseen transactions" badge.
+  // Excludes archived. Returns count of items created after `since` plus the
+  // newest `created_at` overall (so first-time visitors can initialize their
+  // local "lastSeen" to the current head and avoid seeing the entire backlog
+  // as new). Declared before `/:id` so 'count' isn't captured as an id.
+  router.get('/transactions/count', (req, res) => {
+    const since = req.query.since;
+    const sinceMs = since ? Date.parse(since) : null;
+    const txns = loadAllTransactions(paths, false);
+    let count = 0;
+    let latestAt = null;
+    for (const t of txns) {
+      const ts = t.created_at;
+      if (ts && (!latestAt || ts > latestAt)) latestAt = ts;
+      if (sinceMs != null && !Number.isNaN(sinceMs)) {
+        const tms = ts ? Date.parse(ts) : NaN;
+        if (!Number.isNaN(tms) && tms > sinceMs) count++;
+      }
+    }
+    res.json({ count, latestAt });
+  });
+
+  // Lifecycle metadata for the dashboard's status menu. MUST be declared
+  // before `/transactions/:id` — otherwise Express captures the literal word
+  // "lifecycle" as the :id param and serves a 404.
+  router.get('/transactions/lifecycle', (req, res) => {
+    const transitions = {};
+    for (const from of TXN_STATUSES) {
+      transitions[from] = TXN_STATUSES.filter(to => from !== to && validateStatusTransition(from, to).ok);
+    }
+    res.json({ statuses: TXN_STATUSES, transitions });
   });
 
   router.get('/transactions/:id', (req, res) => {
@@ -397,6 +437,36 @@ export function apiRouter(workspace) {
     writeJson(fp, txn);
     res.json({ ok: true, transaction: txn });
   });
+
+  // Admin-only status change endpoint. Validates against the lifecycle
+  // state machine (see engine/tools/transactions.js). When status moves to
+  // `cancelled`, the optional `reason` is recorded.
+  //
+  // Returns 422 on invalid transitions so the dashboard can surface the
+  // reason text inline.
+  router.patch('/transactions/:id/status', (req, res) => {
+    const fp = findTransactionFile(paths, req.params.id);
+    if (!fp) return res.status(404).json({ error: 'Transaction not found' });
+    const { status, reason } = req.body || {};
+    if (!status) return res.status(400).json({ error: 'status is required' });
+    const txn = readJson(fp);
+    const v = validateStatusTransition(txn.status, status);
+    if (!v.ok) return res.status(422).json({ error: v.reason, current_status: txn.status });
+
+    const now = new Date().toISOString();
+    txn.status = status;
+    txn.updated_at = now;
+    if (status === 'completed') txn.completed_at = now;
+    if (status === 'cancelled') {
+      txn.cancelled_at = now;
+      if (typeof reason === 'string' && reason.trim()) {
+        txn.cancellation_reason = reason.trim().slice(0, 500);
+      }
+    }
+    writeJson(fp, txn);
+    res.json({ ok: true, transaction: txn });
+  });
+
 
   router.get('/transactions-stats', (req, res) => {
     const all = loadAllTransactions(paths, true);
@@ -1733,16 +1803,64 @@ export function apiRouter(workspace) {
  * Returns { apiBase, provisioningToken, ownerUsername, ownerId } or null.
  */
 function loadAllTransactions(paths, includeArchived) {
-  const txns = [];
-
+  // First pass: read every row from disk regardless of `includeArchived` so we
+  // can backfill display_index across the full set in stable order before
+  // filtering. Returning a partial view would break the sequence for archived
+  // rows that the dashboard later un-archives.
+  const all = [];
   for (const f of listFiles(paths.activeTransactions, '.json')) {
     const data = readJson(path.join(paths.activeTransactions, f));
     if (!data) continue;
-    if (!includeArchived && data.archived === true) continue;
-    txns.push({ ...data, _file: f });
+    all.push({ data, file: f, path: path.join(paths.activeTransactions, f) });
   }
 
+  backfillDisplayIndex(all);
+
+  const txns = [];
+  for (const r of all) {
+    if (!includeArchived && r.data.archived === true) continue;
+    txns.push({ ...r.data, _file: r.file });
+  }
   return txns.sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
+}
+
+/**
+ * Lazy migration: give legacy rows a sequence number for the dashboard `#`
+ * column. New rows already have a numeric `id` (assigned by the engine), so
+ * they are skipped. Only rows whose `id` is non-numeric AND that lack
+ * `display_index` get a fresh number, in stable created_at order.
+ *
+ * Idempotent — once a row has either form of sequence number it's never
+ * renumbered.
+ */
+function backfillDisplayIndex(records) {
+  const isNumericId = (v) => {
+    if (typeof v === 'number' && Number.isFinite(v)) return v;
+    if (typeof v === 'string' && /^\d+$/.test(v)) return Number(v);
+    return null;
+  };
+
+  let maxIdx = 0;
+  const missing = [];
+  for (const r of records) {
+    const idNum = isNumericId(r.data.id);
+    if (idNum != null) {
+      if (idNum > maxIdx) maxIdx = idNum;
+      continue; // id already serves as the sequence
+    }
+    if (Number.isFinite(r.data.display_index)) {
+      if (r.data.display_index > maxIdx) maxIdx = r.data.display_index;
+      continue;
+    }
+    missing.push(r);
+  }
+  if (missing.length === 0) return;
+  missing.sort((a, b) => new Date(a.data.created_at || 0) - new Date(b.data.created_at || 0));
+  for (const r of missing) {
+    maxIdx += 1;
+    r.data.display_index = maxIdx;
+    try { writeJson(r.path, r.data); } catch { /* best-effort; next load retries */ }
+  }
 }
 
 function findTransaction(paths, id) {

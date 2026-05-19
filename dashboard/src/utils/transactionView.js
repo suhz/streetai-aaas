@@ -42,10 +42,23 @@ export function getTableColumns(viewConfig, txns) {
   return detectExtraColumns(txns);
 }
 
+/**
+ * Render a monetary amount consistently across the dashboard:
+ *   "$ 24.50", "TK 100", etc.
+ * Always inserts a space between the currency token and the amount.
+ * Numeric values are rounded to 2 decimals so weird floating-point
+ * artifacts like 24.500000000001 don't leak into the UI.
+ */
+export function formatCurrency(value, currency) {
+  const n = Number(value);
+  const amount = Number.isFinite(n) ? n.toFixed(2) : String(value);
+  return currency ? `${currency} ${amount}` : amount;
+}
+
 export function formatCellWithConfig(value, key, viewConfig, currency) {
   if (value === null || value === undefined) return '';
   const fmt = viewConfig?.formats?.[key];
-  if (fmt === 'currency') return `${currency}${value}`;
+  if (fmt === 'currency') return formatCurrency(value, currency);
   if (fmt === 'percentage') return `${value}%`;
   if (fmt === 'rating') return '★'.repeat(Math.min(Number(value) || 0, 5));
   if (fmt === 'boolean') return value ? 'Yes' : 'No';

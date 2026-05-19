@@ -65,6 +65,10 @@ async function main() {
   try {
     engine = new AgentEngine({ workspace, provider: config.provider, config });
     await engine.initialize();
+    // Long-lived daemon: enable the delayed-event scheduler so scheduled
+    // actions actually fire. Short-lived engines (chat, run, API calls)
+    // leave this off so they don't keep the process alive.
+    engine.startScheduler();
     log(`Engine ready (${config.provider}/${config.model})`);
   } catch (err) {
     log(`ERROR: Failed to start engine: ${err.message}`);
@@ -110,6 +114,7 @@ async function main() {
   // Graceful shutdown
   const shutdown = async (signal) => {
     log(`Received ${signal}, shutting down...`);
+    try { engine.stopScheduler(); } catch { /* ignore */ }
     for (const connector of connectors) {
       try { await connector.disconnect(); } catch { /* ignore */ }
     }

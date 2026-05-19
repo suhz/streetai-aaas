@@ -11,6 +11,8 @@ import { MemoryManager } from './memory/index.js';
 import { readJson, writeJson } from '../utils/workspace.js';
 import { buildBasePrompt } from './base-prompt.js';
 import { saveTransactionView } from './tools/workspace.js';
+import { maybeSeedTransactionFields } from './tools/transaction-view-seed.js';
+import { loadPending, removeAction } from './scheduler.js';
 import { loadConnection, saveConnection } from '../auth/connections.js';
 import crypto from 'crypto';
 
@@ -40,11 +42,83 @@ export class AgentEngine {
     this.soul = '';
     this.agentName = '';
     this.initialized = false;
+
+    // Scheduler tick timer — only set when startScheduler() is called.
+    // Short-lived engines (chat / run / single API call) leave it null so
+    // they don't keep the process alive past their natural exit.
+    this._schedulerTimer = null;
+    this._schedulerTickInFlight = false;
+  }
+
+  /**
+   * Start the delayed-event scheduler. Should only be called by long-lived
+   * processes (the agent-worker daemon). Calls processEvent for any pending
+   * scheduled action whose `fires_at` has passed. Idempotent — calling twice
+   * does nothing.
+   */
+  startScheduler({ intervalMs = 30_000 } = {}) {
+    if (this._schedulerTimer) return;
+    // Catch-up sweep on start: anything overdue fires immediately, marked
+    // `late: true` so the agent can word the reply accordingly.
+    this._scheduledTick().catch(() => { /* non-fatal */ });
+    this._schedulerTimer = setInterval(() => {
+      this._scheduledTick().catch(() => { /* non-fatal */ });
+    }, intervalMs);
+    if (this._schedulerTimer.unref) this._schedulerTimer.unref();
+  }
+
+  stopScheduler() {
+    if (this._schedulerTimer) {
+      clearInterval(this._schedulerTimer);
+      this._schedulerTimer = null;
+    }
+  }
+
+  /**
+   * One tick of the scheduler. Pulls due actions, removes them from disk
+   * BEFORE firing (so a concurrent tick or a crash mid-fire doesn't
+   * double-trigger), then emits each as a synthetic event through
+   * processEvent. Errors per-action are swallowed so one bad reminder
+   * doesn't poison the rest of the batch.
+   */
+  async _scheduledTick() {
+    if (this._schedulerTickInFlight) return;
+    this._schedulerTickInFlight = true;
+    try {
+      const pending = loadPending(this.paths);
+      const now = Date.now();
+      const due = pending.filter(e => new Date(e.fires_at).getTime() <= now);
+      for (const action of due) {
+        // Remove first so a crash before firing doesn't leave it to retry
+        // forever — at-most-once is the right tradeoff for delayed nudges.
+        try { removeAction(this.paths, action.id); } catch { /* keep going */ }
+        const late = (now - new Date(action.fires_at).getTime()) > 60_000;
+        try {
+          await this.processEvent({
+            platform: action.session.platform,
+            userId: action.session.user_id,
+            userName: action.session.user_name || action.session.user_id,
+            type: 'scheduled',
+            content: `[Scheduled reminder for you${late ? ' — note: this is late, fired on next agent start' : ''}] ${action.instruction}`,
+            metadata: {
+              is_scheduled: true,
+              scheduled_id: action.id,
+              scheduled_context: action.context || null,
+              late,
+            },
+          });
+        } catch { /* per-action failures are normal turn failures */ }
+      }
+    } finally {
+      this._schedulerTickInFlight = false;
+    }
   }
 
   async initialize() {
-    // Build base prompt (AaaS fundamentals + workspace state)
-    this.basePrompt = buildBasePrompt(this.paths);
+    // Build base prompt (AaaS fundamentals + workspace state). The current
+    // time injected here is overwritten on every processEvent — sampled at
+    // the start of each turn so the model always sees fresh "now."
+    this.basePrompt = buildBasePrompt(this.paths, { now: new Date() });
 
     // Load SKILL.md and SOUL.md
     this.skill = readText(this.paths.skill) || '';
@@ -71,6 +145,22 @@ export class AgentEngine {
     await this.toolRegistry.loadConnectorTools();
 
     this.initialized = true;
+
+    // Fire-and-forget: seed the Transaction Fields block once if the skill
+    // is missing it or still on template defaults. Fully isolated — never
+    // throws, never blocks init. See tools/transaction-view-seed.js.
+    this._kickTransactionFieldsSeed();
+  }
+
+  /**
+   * Best-effort, non-blocking seeding trigger. Safe to call repeatedly —
+   * the seed module dedups via a state file keyed by skill content hash.
+   */
+  _kickTransactionFieldsSeed() {
+    if (!this.provider) return;
+    Promise.resolve()
+      .then(() => maybeSeedTransactionFields({ paths: this.paths, provider: this.provider }))
+      .catch(() => { /* swallow — never affect the live agent loop */ });
   }
 
   /**
@@ -157,11 +247,27 @@ export class AgentEngine {
       content: content,
     });
 
-    // 3. Get relevant memory facts
-    const relevantFacts = this.memoryManager.getRelevantFacts(
-      content,
-      this.config.context?.budgets?.memory || 2000
-    );
+    // 2b. Resolve mode early — needed for memory scope and tool execution.
+    // Use session-stored mode if available (set by /admin or /customer commands).
+    // metadata.force_admin_mode wins regardless — used by processOwnerReply
+    // so an owner-reply turn runs in admin mode without polluting the
+    // customer's stored session mode.
+    const sessionMode = this.sessionManager.getSessionMeta(platform, userId, 'mode');
+    const mode = metadata?.force_admin_mode
+      ? 'admin'
+      : sessionMode || metadata?.mode || 'admin';
+
+    // 3. Get relevant memory facts. Mode determines scope: customer mode
+    //    pulls this customer's user facts + business facts; admin mode pulls
+    //    business facts only (admin sessions aren't customer-scoped).
+    //    See engine/memory/index.js for the split rationale.
+    const relevantFacts = this.memoryManager.getRelevantFactsForTurn({
+      query: content,
+      platform,
+      userId,
+      mode,
+      maxTokens: this.config.context?.budgets?.memory || 2000,
+    });
 
     // 4. Build platform context if available
     let platformContext = '';
@@ -176,16 +282,11 @@ export class AgentEngine {
       }
     }
 
-    // 5. Refresh workspace state (data files / extensions may have changed)
-    // Use session-stored mode if available (set by /admin or /customer commands).
-    // metadata.force_admin_mode wins regardless — used by processOwnerReply
-    // so an owner-reply turn runs in admin mode without polluting the
-    // customer's stored session mode.
-    const sessionMode = this.sessionManager.getSessionMeta(platform, userId, 'mode');
-    const mode = metadata?.force_admin_mode
-      ? 'admin'
-      : sessionMode || metadata?.mode || 'admin';
-    this.basePrompt = buildBasePrompt(this.paths, { mode });
+    // 5. Refresh workspace state (data files / extensions may have changed).
+    // `mode` was resolved earlier (step 2b) — reused here for the base prompt.
+    // `now` is sampled fresh per turn so the model's authoritative clock
+    // doesn't drift across long-lived engine instances.
+    this.basePrompt = buildBasePrompt(this.paths, { mode, now: new Date() });
 
     // Expose the current event to tools so notify_owner can capture context.
     if (this.toolRegistry?.setEventContext) {
@@ -286,8 +387,8 @@ export class AgentEngine {
         // 8. Async: compress session if over budget
         this._maybeCompress(platform, userId);
 
-        // 9. Async: extract memory facts
-        this._maybeExtractFacts(platform, userId);
+        // 9. Async: extract memory facts (mode-scoped — see _maybeExtractFacts).
+        this._maybeExtractFacts(platform, userId, mode);
 
         return { response, toolsUsed, tokensUsed: totalTokens };
       }
@@ -313,6 +414,9 @@ export class AgentEngine {
           this.skill = readText(this.paths.skill) || '';
           const nameMatch = this.skill.match(/^#\s+(.+?)(?:\s*—|\s*-|\n)/m);
           this.agentName = nameMatch ? nameMatch[1].trim() : path.basename(this.workspace);
+          // Skill content changed — re-evaluate whether the Transaction Fields
+          // block now needs seeding. Fire-and-forget; deduped by content hash.
+          this._kickTransactionFieldsSeed();
         } else if (tc.name === 'write_soul') {
           this.soul = readText(this.paths.soul) || '';
         }
@@ -467,17 +571,28 @@ export class AgentEngine {
 
   /**
    * Extract memory facts in the background after an interaction.
+   *
+   * Mode determines the destination store:
+   *   admin    → business facts (memory/facts.json)
+   *   customer → user facts     (memory/users/<platform>/<userId>.json)
+   *
+   * Only business facts get the periodic pruneOldest call — user files are
+   * naturally bounded by how much a single customer has talked to the agent
+   * and are not at risk of unbounded growth in the same way.
    */
-  _maybeExtractFacts(platform, userId) {
+  _maybeExtractFacts(platform, userId, mode = 'admin') {
     const session = this.sessionManager.getSession(platform, userId);
 
     // Only extract every 5 messages to save LLM calls
     if (session.messages.length % 5 !== 0) return;
 
-    this.memoryManager.extractFacts(this.provider, session.messages)
+    this.memoryManager
+      .extractFacts(this.provider, session.messages, { mode, platform, userId })
       .then(() => {
-        const maxFacts = this.config.context?.memoryMaxFacts || 200;
-        this.memoryManager.pruneOldest(maxFacts);
+        if (mode === 'admin') {
+          const maxFacts = this.config.context?.memoryMaxFacts || 200;
+          this.memoryManager.pruneBusinessFacts(maxFacts);
+        }
       })
       .catch(() => { /* non-critical */ });
   }

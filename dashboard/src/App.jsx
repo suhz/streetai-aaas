@@ -18,6 +18,7 @@ import Hub from './pages/Hub.jsx';
 import GetStarted from './pages/GetStarted.jsx';
 import Guide from './pages/Guide.jsx';
 import SetupGuide from './pages/SetupGuide.jsx';
+import { useUnseenTransactions } from './hooks/useUnseenTransactions.js';
 
 function Logo() {
   return (
@@ -116,11 +117,28 @@ function Sidebar({ navItems, mode, onLogoClick, workspaceName }) {
         <div key={section || '_root'}>
           {section && <div className="sidebar-section">{section}</div>}
           <ul className="sidebar-nav">
-            {items.map(({ path, label, icon, highlight }) => (
+            {items.map(({ path, label, icon, highlight, badge }) => (
               <li key={path}>
                 <NavLink to={path} end={path === '/' || path.match(/^\/ws\/[^/]+$/)} className={({ isActive }) => `${isActive ? 'active' : ''}${highlight ? ' nav-highlight' : ''}`}>
                   <span className="nav-icon">{icon}</span>
-                  {label}
+                  <span style={{ flex: 1 }}>{label}</span>
+                  {typeof badge === 'number' && badge > 0 && (
+                    <span
+                      style={{
+                        background: 'var(--accent, #4ec5ca)',
+                        color: '#fff',
+                        fontSize: 11,
+                        fontWeight: 600,
+                        lineHeight: 1,
+                        padding: '3px 7px',
+                        borderRadius: 10,
+                        minWidth: 18,
+                        textAlign: 'center',
+                      }}
+                    >
+                      {badge > 99 ? '99+' : badge}
+                    </span>
+                  )}
                 </NavLink>
               </li>
             ))}
@@ -151,13 +169,26 @@ function WorkspaceView() {
   );
 }
 
+function withTransactionsBadge(navItems, count, prefix) {
+  if (!count) return navItems;
+  const target = `${prefix}/transactions`;
+  return navItems.map(section => ({
+    ...section,
+    items: section.items.map(item =>
+      item.path === target ? { ...item, badge: count } : item
+    ),
+  }));
+}
+
 function WorkspaceLayout({ navItems, wsName, prefix }) {
   const navigate = useNavigate();
+  const unseenTxns = useUnseenTransactions();
+  const decoratedNav = withTransactionsBadge(navItems, unseenTxns, prefix);
 
   return (
     <div className="layout">
       <Sidebar
-        navItems={navItems}
+        navItems={decoratedNav}
         mode="hub"
         workspaceName={wsName}
         onLogoClick={() => navigate('/')}
@@ -229,11 +260,13 @@ function HubLayout() {
 function StandaloneLayout() {
   const navigate = useNavigate();
   const navItems = workspaceNav('');
+  const unseenTxns = useUnseenTransactions();
+  const decoratedNav = withTransactionsBadge(navItems, unseenTxns, '');
 
   return (
     <div className="layout">
       <Sidebar
-        navItems={navItems}
+        navItems={decoratedNav}
         mode="workspace"
         onLogoClick={() => navigate('/')}
       />

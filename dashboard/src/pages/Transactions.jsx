@@ -1,10 +1,54 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useContext } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { useFetch, useResolveUrl, useApi } from '../hooks/useApi.js';
-import { getTableColumns, getLabel, formatCellWithConfig, prettyKey } from '../utils/transactionView.js';
+import { useFetch, useResolveUrl, useApi, WorkspaceContext } from '../hooks/useApi.js';
+import { getTableColumns, getLabel, formatCellWithConfig, formatCurrency, prettyKey } from '../utils/transactionView.js';
+import { setLastSeen, getLastSeen } from '../utils/unseenTransactions.js';
 import TransactionViewEditor from '../components/TransactionViewEditor.jsx';
 
 /** Extract unique statuses from actual transaction data */
+/**
+ * Format the per-row sequence label shown in the `#` column.
+ *
+ * New rows (engine-assigned ids) have a digit-only string `id`. Legacy rows
+ * have an opaque string `id` plus a backfilled numeric `display_index`.
+ * This helper picks whichever sequence value exists.
+ */
+export function formatSeq(t) {
+  if (typeof t.id === 'number' && Number.isFinite(t.id)) return `#${t.id}`;
+  if (typeof t.id === 'string' && /^\d+$/.test(t.id)) return `#${t.id}`;
+  if (Number.isFinite(t.display_index)) return `#${t.display_index}`;
+  return '';
+}
+
+/**
+ * Client-side substring filter for the Transactions list. Matches against
+ * the row's most-likely-identifying fields (id, user, service, status) plus
+ * any other string/number field on the row. Case-insensitive. Nested objects
+ * and arrays are intentionally skipped to keep the filter cheap and the
+ * matches predictable — searching for "sparkling water" against an items
+ * array would be surprising both when it hits and when it doesn't.
+ */
+function applyQuery(rows, query) {
+  if (!rows) return rows;
+  const q = (query || '').trim().toLowerCase();
+  if (!q) return rows;
+  return rows.filter(t => rowMatchesQuery(t, q));
+}
+
+function rowMatchesQuery(t, q) {
+  for (const v of Object.values(t)) {
+    if (v == null) continue;
+    if (typeof v === 'string') {
+      if (v.toLowerCase().includes(q)) return true;
+    } else if (typeof v === 'number' || typeof v === 'boolean') {
+      if (String(v).toLowerCase().includes(q)) return true;
+    }
+    // Arrays/objects skipped: cheaper, less surprising. The id-by-number
+    // case is covered by the top-level `id` field being a string of digits.
+  }
+  return false;
+}
+
 function getStatuses(txns) {
   if (!txns || txns.length === 0) return [];
   const seen = new Set();
@@ -15,20 +59,96 @@ function getStatuses(txns) {
 }
 
 export default function Transactions() {
+  const workspace = useContext(WorkspaceContext);
   const [filter, setFilter] = useState('all');
-  const [showAll, setShowAll] = useState(false);
+  // View mode toggle: 'active' (default) shows non-archived rows;
+  // 'archived' shows archived rows only. There is no mixed mode — the
+  // previous "show all" was confusing because archive icons differed per row.
+  const [viewMode, setViewMode] = useState('active');
+  const showArchived = viewMode === 'archived';
   const [searchParams, setSearchParams] = useSearchParams();
   const selected = searchParams.get('id');
+
+  // ── "New since last visit" highlight ──
+  // Snapshot the last-seen timestamp at mount, BEFORE the sidebar-badge effect
+  // advances it. Rows with `created_at > highlightSince` get a subtle accent
+  // until the user clicks into them or revisits the tab (next mount captures
+  // the updated lastSeen and the highlight clears).
+  const [highlightSince] = useState(() => getLastSeen(workspace));
+  const [dismissedNew, setDismissedNew] = useState(() => new Set());
+  const dismissNewHighlight = (id) => {
+    if (!id) return;
+    setDismissedNew(prev => {
+      if (prev.has(id)) return prev;
+      const next = new Set(prev);
+      next.add(id);
+      return next;
+    });
+  };
+  const isNewRow = (t) => {
+    if (!highlightSince) return false;
+    const id = t.id || t._file;
+    if (dismissedNew.has(id)) return false;
+    return t.created_at && t.created_at > highlightSince;
+  };
+
   const setSelected = (id) => {
-    if (id) setSearchParams({ id });
-    else setSearchParams({});
+    if (id) {
+      dismissNewHighlight(id);
+      setSearchParams({ id });
+    } else setSearchParams({});
   };
 
   const [editorOpen, setEditorOpen] = useState(false);
-  const url = `/api/transactions?all=${showAll}`;
+  const [query, setQuery] = useState('');
+  const url = showArchived ? '/api/transactions?archived=true' : '/api/transactions';
   const { data: allTxns, loading, error, refetch: refetchTxns } = useFetch(url);
   const { data: stats, refetch: refetchStats } = useFetch('/api/transactions-stats');
   const { data: viewConfig, refetch: refetchView } = useFetch('/api/transaction-view');
+
+  // Background poll while this tab is open. Cheap count-check against the
+  // frozen highlightSince — when the server reports new rows since then we
+  // refetch the full list. New arrivals automatically pick up the highlight
+  // because `highlightSince` doesn't move while the user is on this tab.
+  // Paused when the tab/window is hidden so we don't churn in the background.
+  useEffect(() => {
+    if (showArchived) return; // archived view is static — no need to poll
+    const POLL_MS = 15000;
+    const resolveCount = (since) => {
+      const base = since
+        ? `/api/transactions/count?since=${encodeURIComponent(since)}`
+        : '/api/transactions/count';
+      return workspace ? base.replace('/api/', `/api/ws/${workspace}/`) : base;
+    };
+    let lastKnown = highlightSince || null;
+    let cancelled = false;
+
+    const tick = async () => {
+      if (document.visibilityState === 'hidden') return;
+      try {
+        const r = await fetch(resolveCount(lastKnown));
+        if (!r.ok || cancelled) return;
+        const d = await r.json();
+        if (d.count > 0) {
+          refetchTxns();
+          refetchStats();
+          // Advance our local watermark so the next tick only flags rows
+          // newer than what this tick already triggered a refetch for.
+          if (d.latestAt) lastKnown = d.latestAt;
+        }
+      } catch { /* network blip — next tick retries */ }
+    };
+
+    const interval = setInterval(tick, POLL_MS);
+    const onVisible = () => { if (document.visibilityState === 'visible') tick(); };
+    document.addEventListener('visibilitychange', onVisible);
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
+  }, [workspace, showArchived, highlightSince, refetchTxns, refetchStats]);
   const api = useApi();
 
   // Optimistic archive state. While `pendingArchive` is set, the row is
@@ -38,20 +158,34 @@ export default function Transactions() {
   const undoTimerRef = useRef(null);
   useEffect(() => () => clearTimeout(undoTimerRef.current), []);
 
+  // Mark all currently-loaded transactions as seen for the sidebar badge.
+  // Re-runs whenever the transaction list updates, so the badge stays at 0
+  // while the user is sitting on this page even as new txns arrive.
+  useEffect(() => {
+    if (!allTxns) return;
+    let latest = null;
+    for (const t of allTxns) {
+      const ts = t.created_at;
+      if (ts && (!latest || ts > latest)) latest = ts;
+    }
+    setLastSeen(workspace, latest || new Date().toISOString());
+  }, [allTxns, workspace]);
+
   const cur = stats?.currency || '';
   const statuses = getStatuses(allTxns);
   const visibleTxns = pendingArchive
     ? allTxns?.filter(t => (t.id || t._file) !== pendingArchive.id)
     : allTxns;
-  const txns = filter === 'all' ? visibleTxns : visibleTxns?.filter(t => t.status === filter);
+  const statusFiltered = filter === 'all' ? visibleTxns : visibleTxns?.filter(t => t.status === filter);
+  const txns = applyQuery(statusFiltered, query);
   const extraCols = getTableColumns(viewConfig, allTxns);
 
   // ── Pagination ──
   const PAGE_SIZE = 20;
   const [page, setPage] = useState(1);
   const totalPages = Math.max(1, Math.ceil((txns?.length || 0) / PAGE_SIZE));
-  // Reset to page 1 whenever the filter / archive toggle changes the row set
-  useEffect(() => { setPage(1); }, [filter, showAll]);
+  // Reset to page 1 whenever the filter / archive toggle / search query changes the row set
+  useEffect(() => { setPage(1); }, [filter, viewMode, query]);
   // Clamp when the underlying list shrinks (e.g. after archiving the last row on a page)
   useEffect(() => { if (page > totalPages) setPage(totalPages); }, [page, totalPages]);
   const pageStart = (page - 1) * PAGE_SIZE;
@@ -61,6 +195,14 @@ export default function Transactions() {
     if (e) e.stopPropagation();
     const id = txn.id || txn._file;
     const wasArchived = txn.archived === true;
+    // If another archive is still pending, finalize it first — refetch so its
+    // row stays hidden via the fresh data (not via pendingArchive, which can
+    // only track one id at a time).
+    if (pendingArchive && pendingArchive.id !== id) {
+      clearTimeout(undoTimerRef.current);
+      refetchTxns();
+      refetchStats();
+    }
     setPendingArchive({ id, wasArchived });
     try {
       await api.post(`/api/transactions/${encodeURIComponent(id)}/${wasArchived ? 'unarchive' : 'archive'}`);
@@ -124,7 +266,7 @@ export default function Transactions() {
         <div className="stat-grid">
           <div className="stat stat-green">
             <div className="stat-label">Revenue</div>
-            <div className="stat-value green">{cur ? `${cur} ${stats.revenue}` : stats.revenue}</div>
+            <div className="stat-value green">{formatCurrency(stats.revenue, cur)}</div>
           </div>
           <div className="stat stat-green">
             <div className="stat-label">Completed</div>
@@ -160,7 +302,7 @@ export default function Transactions() {
         )}
       </div>
 
-      <div className="btn-group" style={{ flexWrap: 'wrap' }}>
+      <div className="btn-group" style={{ flexWrap: 'wrap', alignItems: 'center' }}>
         {statuses.length > 0 && (
           <button
             className={`btn ${filter === 'all' ? 'btn-primary' : ''}`}
@@ -178,8 +320,44 @@ export default function Transactions() {
             {s.replace(/_/g, ' ')}
           </button>
         ))}
-        <button className="btn" onClick={() => setShowAll(!showAll)} style={{ marginLeft: 'auto' }}>
-          {showAll ? 'Active only' : 'Show archived'}
+        <div
+          style={{
+            marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: 6,
+            position: 'relative',
+          }}
+        >
+          <input
+            type="search"
+            value={query}
+            onChange={e => setQuery(e.target.value)}
+            placeholder="Search id, user, service…"
+            aria-label="Search transactions"
+            style={{
+              width: 220, padding: '6px 28px 6px 10px',
+              border: '1px solid var(--border)', borderRadius: 6,
+              background: 'var(--bg-secondary)', color: 'var(--text)',
+              fontSize: 13, outline: 'none',
+            }}
+          />
+          {query && (
+            <button
+              onClick={() => setQuery('')}
+              aria-label="Clear search"
+              title="Clear"
+              style={{
+                position: 'absolute', right: 6,
+                background: 'none', border: 'none', cursor: 'pointer',
+                color: 'var(--text-muted)', fontSize: 16, lineHeight: 1, padding: '0 4px',
+              }}
+            >×</button>
+          )}
+        </div>
+        <button
+          className="btn"
+          onClick={() => setViewMode(showArchived ? 'active' : 'archived')}
+          title={showArchived ? 'Back to active transactions' : 'View archived transactions only'}
+        >
+          {showArchived ? 'Active' : 'Archived'}
         </button>
       </div>
 
@@ -212,6 +390,7 @@ export default function Transactions() {
           <table className="table">
             <thead>
               <tr>
+                <th style={{ width: 56 }}>#</th>
                 <th>Service</th>
                 <th>User</th>
                 <th>Status</th>
@@ -226,8 +405,28 @@ export default function Transactions() {
             <tbody>
               {pagedTxns.map((t, i) => {
                 const isArchived = t.archived === true;
+                const newHighlight = isNewRow(t);
+                const seq = formatSeq(t);
                 return (
-                <tr key={t.id || i} onClick={() => setSelected(t.id || t._file)} style={{ cursor: 'pointer' }}>
+                <tr
+                  key={t.id || i}
+                  onClick={() => setSelected(t.id || t._file)}
+                  className={newHighlight ? 'txn-row-new' : undefined}
+                  style={{ cursor: 'pointer' }}
+                >
+                  <td
+                    title={t.id || ''}
+                    style={{
+                      fontVariantNumeric: 'tabular-nums',
+                      fontSize: 13,
+                      color: 'var(--text-muted)',
+                      width: newHighlight ? 96 : 56,
+                      whiteSpace: 'nowrap',
+                    }}
+                  >
+                    {seq}
+                    {newHighlight && <span className="txn-new-pill">NEW</span>}
+                  </td>
                   <td>
                     <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
                       {t.service || ''}
@@ -244,7 +443,7 @@ export default function Transactions() {
                   {extraCols.map(k => (
                     <td key={k} style={{ fontSize: 13 }}>{formatCellWithConfig(t[k], k, viewConfig, cur)}</td>
                   ))}
-                  <td>{t.cost ? `${cur} ${t.cost}` : 'Free'}</td>
+                  <td>{t.cost ? formatCurrency(t.cost, cur) : 'Free'}</td>
                   <td style={{ color: 'var(--text-muted)', fontSize: 13 }}>
                     {t.created_at ? new Date(t.created_at).toLocaleDateString() : ''}
                   </td>
@@ -321,7 +520,7 @@ export default function Transactions() {
               {Object.entries(stats.byService).map(([svc, rev]) => (
                 <tr key={svc}>
                   <td>{svc}</td>
-                  <td style={{ color: 'var(--green)', fontWeight: 600 }}>{cur ? `${cur} ${rev}` : rev}</td>
+                  <td style={{ color: 'var(--green)', fontWeight: 600 }}>{formatCurrency(rev, cur)}</td>
                 </tr>
               ))}
             </tbody>
@@ -419,7 +618,7 @@ function formatDate(iso) {
 /** Format a value using the view config format hints */
 function applyFormat(value, key, viewConfig, currency) {
   const fmt = viewConfig?.formats?.[key];
-  if (fmt === 'currency' && value != null) return `${currency}${value}`;
+  if (fmt === 'currency' && value != null) return formatCurrency(value, currency);
   if (fmt === 'percentage' && value != null) return `${value}%`;
   if (fmt === 'rating' && value != null) return '★'.repeat(Math.min(Number(value) || 0, 5)) + '☆'.repeat(Math.max(0, 5 - (Number(value) || 0)));
   if (fmt === 'date' || fmt === 'datetime') return formatDate(value);
@@ -499,7 +698,9 @@ function FieldGroup({ title, data: obj, viewConfig, currency, accent }) {
 // ─── Detail view ──────────────────────────────────
 
 function TransactionDetail({ id, onBack, currency: fallbackCurrency, viewConfig, onArchived, onCompleted }) {
-  const { data, loading, error } = useFetch(`/api/transactions/${id}`);
+  const { data, loading, error, refetch } = useFetch(`/api/transactions/${id}`);
+  const { data: lifecycle } = useFetch('/api/transactions/lifecycle');
+  const api = useApi();
   const resolveUrl = useResolveUrl();
 
   if (loading) return <div className="loading">Loading transaction</div>;
@@ -527,12 +728,26 @@ function TransactionDetail({ id, onBack, currency: fallbackCurrency, viewConfig,
         <h1 className="page-title" style={{ fontSize: 18 }}>
           {data.service || 'Transaction'}
         </h1>
-        <span className={`badge ${data.status}`}>{data.status?.replace(/_/g, ' ')}</span>
+        <StatusSelector
+          status={data.status}
+          allowed={lifecycle?.transitions?.[data.status] || []}
+          onChange={async (next, reason) => {
+            try {
+              await api.patch(`/api/transactions/${encodeURIComponent(id)}/status`, { status: next, reason });
+            } catch (e) {
+              alert(e.message || 'Status change failed');
+            }
+            refetch();
+          }}
+        />
         <div style={{ marginLeft: 'auto', display: 'inline-flex', gap: 6 }}>
           {onCompleted && (
             <button
               className="btn btn-sm"
-              onClick={() => { if (!isCompleted) onCompleted(data); }}
+              onClick={async () => {
+                if (isCompleted) return;
+                try { await onCompleted(data); } finally { refetch(); }
+              }}
               disabled={isCompleted}
               title={isCompleted ? 'Already completed' : 'Mark this transaction as completed'}
               style={isCompleted ? { color: 'var(--green)', opacity: 0.7 } : undefined}
@@ -564,7 +779,7 @@ function TransactionDetail({ id, onBack, currency: fallbackCurrency, viewConfig,
         <div className="txn-summary-item">
           <div className="txn-summary-label">Cost</div>
           <div className="txn-summary-value" style={{ color: 'var(--green)' }}>
-            {data.cost ? `${currency}${data.cost}` : 'Free'}
+            {data.cost ? formatCurrency(data.cost, currency) : 'Free'}
           </div>
         </div>
         {data.rating != null && (
@@ -643,29 +858,15 @@ function TransactionDetail({ id, onBack, currency: fallbackCurrency, viewConfig,
         </div>
       )}
 
-      {/* Items table (always shown if present) */}
+      {/* Items section. Renders three shapes:
+          - array of objects → table (keys become columns)
+          - array of scalars (strings/numbers/booleans) → bulleted list
+          - mixed → bulleted list, JSON-stringify non-strings
+        Strings are array-like in JS, so the previous unconditional Object.keys/
+        Object.values path would render each character as a cell — guarding by
+        shape avoids that and accepts any reasonable agent output. */}
       {data.items && Array.isArray(data.items) && data.items.length > 0 && (
-        <div className="card" style={{ padding: 0 }}>
-          <div className="card-title" style={{ padding: '16px 18px 0' }}>Items</div>
-          <table className="table">
-            <thead>
-              <tr>
-                {Object.keys(data.items[0]).map(k => (
-                  <th key={k}>{getLabel(viewConfig, k)}</th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {data.items.map((item, i) => (
-                <tr key={i}>
-                  {Object.values(item).map((v, j) => (
-                    <td key={j}>{typeof v === 'object' ? JSON.stringify(v) : String(v ?? '—')}</td>
-                  ))}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <ItemsCard items={data.items} viewConfig={viewConfig} />
       )}
 
       {/* Sub-transactions */}
@@ -686,7 +887,7 @@ function TransactionDetail({ id, onBack, currency: fallbackCurrency, viewConfig,
                   {Object.entries(sub).map(([k, v], j) => (
                     <td key={j}>
                       {k === 'status' ? <span className={`badge ${v}`}>{v}</span>
-                        : k === 'cost' ? (v ? `${currency}${v}` : 'Free')
+                        : k === 'cost' ? (v ? formatCurrency(v, currency) : 'Free')
                         : typeof v === 'object' ? JSON.stringify(v) : String(v ?? '—')}
                     </td>
                   ))}
@@ -711,6 +912,161 @@ function TransactionDetail({ id, onBack, currency: fallbackCurrency, viewConfig,
 }
 
 /**
+ * Items card renderer. The agent may save items as:
+ *  - an array of objects ({ name, qty, price, ... })  → table
+ *  - an array of scalars  ("Sparkling Water")          → bulleted list
+ *  - a mixed array                                     → bulleted list,
+ *    with non-string entries JSON-stringified for safety.
+ *
+ * Caller must pre-check that `items` is a non-empty array.
+ */
+/**
+ * Clickable status badge in the detail header. Opens a small popover with
+ * the transitions allowed from the current status (driven by the server's
+ * lifecycle map). Cancelling prompts for a reason.
+ *
+ * Terminal statuses (completed/cancelled) show no menu — they're closed.
+ */
+function StatusSelector({ status, allowed, onChange }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onClickAway = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
+    document.addEventListener('mousedown', onClickAway);
+    return () => document.removeEventListener('mousedown', onClickAway);
+  }, [open]);
+
+  const hasOptions = Array.isArray(allowed) && allowed.length > 0;
+  const label = (status || '').replace(/_/g, ' ');
+
+  const pick = (next) => {
+    setOpen(false);
+    let reason;
+    if (next === 'cancelled') {
+      const r = window.prompt('Cancellation reason (optional):', '');
+      if (r === null) return; // user cancelled the prompt
+      reason = r || undefined;
+    }
+    onChange(next, reason);
+  };
+
+  return (
+    <span ref={ref} style={{ position: 'relative', display: 'inline-flex' }}>
+      <button
+        type="button"
+        onClick={() => hasOptions && setOpen(v => !v)}
+        className={`badge ${status}`}
+        title={hasOptions ? 'Click to change status' : 'Status is final'}
+        style={{
+          border: 'none',
+          cursor: hasOptions ? 'pointer' : 'default',
+          padding: '3px 9px',
+          font: 'inherit',
+        }}
+      >
+        {label}{hasOptions ? ' ▾' : ''}
+      </button>
+      {open && hasOptions && (
+        <div
+          style={{
+            position: 'absolute', top: '100%', left: 0, marginTop: 4, zIndex: 20,
+            background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 8,
+            boxShadow: '0 4px 16px rgba(0,0,0,0.15)', minWidth: 160, padding: 4,
+          }}
+        >
+          <div style={{ fontSize: 11, color: 'var(--text-muted)', padding: '4px 10px 2px' }}>
+            Change status to…
+          </div>
+          {allowed.map(next => (
+            <button
+              key={next}
+              type="button"
+              onClick={() => pick(next)}
+              style={{
+                display: 'block', width: '100%', textAlign: 'left',
+                padding: '6px 10px', background: 'none', border: 'none',
+                color: 'var(--text)', cursor: 'pointer', fontSize: 13,
+                borderRadius: 4,
+              }}
+              onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-card-hover)'}
+              onMouseLeave={e => e.currentTarget.style.background = 'none'}
+            >
+              {next.replace(/_/g, ' ')}
+            </button>
+          ))}
+        </div>
+      )}
+    </span>
+  );
+}
+
+function ItemsCard({ items, viewConfig }) {
+  const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+  const allObjects = items.every(isObject);
+
+  if (allObjects) {
+    // Prefer the declared `item_fields` order/labels from SKILL.md when
+    // present. Falls back to the union of keys seen on actual items so
+    // partially-shaped objects still render and any extra keys the agent
+    // attached are not silently dropped.
+    const declared = Array.isArray(viewConfig?.item_fields) ? viewConfig.item_fields : [];
+    const declaredKeys = declared.map(f => f.key);
+    const seen = new Set(declaredKeys);
+    const extras = [];
+    for (const item of items) {
+      for (const k of Object.keys(item)) {
+        if (!seen.has(k)) { seen.add(k); extras.push(k); }
+      }
+    }
+    const keys = [...declaredKeys, ...extras];
+    return (
+      <div className="card" style={{ padding: 0 }}>
+        <div className="card-title" style={{ padding: '16px 18px 0' }}>Items</div>
+        <table className="table">
+          <thead>
+            <tr>{keys.map(k => <th key={k}>{getLabel(viewConfig, k)}</th>)}</tr>
+          </thead>
+          <tbody>
+            {items.map((item, i) => (
+              <tr key={i}>
+                {keys.map(k => {
+                  const v = item[k];
+                  return (
+                    <td key={k}>
+                      {v == null
+                        ? '—'
+                        : (typeof v === 'object' ? JSON.stringify(v) : String(v))}
+                    </td>
+                  );
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    );
+  }
+
+  // Scalar or mixed list → render as a clean bulleted list.
+  return (
+    <div className="card" style={{ padding: '16px 18px' }}>
+      <div className="card-title" style={{ paddingBottom: 8 }}>Items</div>
+      <ul style={{ margin: 0, paddingLeft: 20, fontSize: 14, lineHeight: 1.7 }}>
+        {items.map((it, i) => (
+          <li key={i}>
+            {it == null
+              ? '—'
+              : (typeof it === 'object' ? JSON.stringify(it) : String(it))}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+/**
  * Agent-configured detail view.
  * Renders sections defined in viewConfig.detail_sections,
  * then shows any remaining fields not covered by the sections.
@@ -725,6 +1081,10 @@ function ConfiguredDetail({ data, viewConfig, currency }) {
     'cost', 'currency', 'rating', 'created_at', 'updated_at', 'completed_at',
     '_file', 'items', 'sub_transactions', 'files', 'dispute', 'dispute_reason',
   ]);
+  // Fields rendered as their own dedicated cards lower on the page. Even
+  // when SKILL.md's `## Transaction Fields` declares them (e.g. `items`),
+  // they must be omitted from inline detail_sections to avoid double render.
+  const renderedSeparately = new Set(['items', 'sub_transactions', 'files']);
 
   for (const section of sections) {
     for (const f of section.fields) coveredFields.add(f);
@@ -739,7 +1099,9 @@ function ConfiguredDetail({ data, viewConfig, currency }) {
   return (
     <>
       {sections.map((section, i) => {
-        const fields = section.fields.filter(k => data[k] !== undefined && data[k] !== null);
+        const fields = section.fields.filter(k =>
+          data[k] !== undefined && data[k] !== null && !renderedSeparately.has(k)
+        );
         if (fields.length === 0) return null;
         return (
           <div key={i} className="card">

@@ -15,9 +15,15 @@ try { Database = (await import('better-sqlite3')).default; } catch {}
  * - What data files, extensions, and transactions exist in the workspace
  * - How to help the owner set up the agent from scratch
  */
-export function buildBasePrompt(paths, { mode = 'admin' } = {}) {
+export function buildBasePrompt(paths, { mode = 'admin', now = new Date() } = {}) {
   const sections = [];
   const isAdmin = mode === 'admin';
+
+  // ── Current time (universal — needed for every temporal reasoning) ──
+  // Injected once at the top so the model has an authoritative "now" before
+  // any mode-specific instructions land. Source: the engine's server clock,
+  // sampled at the start of each processEvent. Connector-agnostic.
+  sections.push(buildCurrentTimeSection(paths, now));
 
   // ── Core identity ──
   if (isAdmin) {
@@ -36,11 +42,13 @@ Every service interaction with real customers follows five phases:
 
 1. **Explore** — Understand what the user wants. Ask clarifying questions. Check if you can help.
 2. **Create Service** — Propose a plan with clear deliverables and cost. Get user approval before proceeding.
-3. **Create Transaction** — Record the job. Use the \`create_transaction\` tool.
+3. **Create Transaction** — Record the job. Use the \`create_transaction\` tool. The platform assigns a short reference number (e.g. \`#47\`) and returns it in the response. When the service involves delivery, scheduling, or anything the customer might check on later, share that number with them so they have a reference to quote.
 4. **Deliver Service** — Do the work. Query your data, call extensions, prepare results, send to user.
 5. **Complete Transaction** — Confirm satisfaction. Use the \`complete_transaction\` tool. Send an invoice.
 
-**Files in transactions:** When a customer sends a file as part of a service, save it under \`data/\` and call \`attach_file_to_transaction\` to link it to the transaction. The file stays where you saved it.`);
+**Files in transactions:** When a customer sends a file as part of a service, save it under \`data/\` and call \`attach_file_to_transaction\` to link it to the transaction. The file stays where you saved it.
+
+**Transaction lifecycle:** Status moves \`pending → in_progress → completed\` (or \`cancelled\` / \`disputed\`). Move status forward only when you are doing the work yourself. Leave it at \`pending\` after creation — the admin advances it to \`in_progress\` from the dashboard when they actually start. A customer can change or cancel a \`pending\` transaction freely; once \`in_progress\`, \`cancel_transaction\` is refused for the agent — escalate via \`notify_owner\`. Use \`cancel_transaction\` (not \`update_transaction\`) to cancel.`);
   } else {
     sections.push(`# AaaS — Agent as a Service
 
@@ -50,7 +58,7 @@ Every service interaction follows five phases:
 
 1. **Explore** — Understand what the user wants. Ask clarifying questions. Check if you can help.
 2. **Create Service** — Propose a plan with clear deliverables and cost. Get user approval before proceeding.
-3. **Create Transaction** — Record the job. Use the \`create_transaction\` tool.
+3. **Create Transaction** — Record the job. Use the \`create_transaction\` tool. The platform assigns a short reference number (e.g. \`#47\`) and returns it in the response. When the service involves delivery, scheduling, or anything the customer might check on later, share that number with them so they have a reference to quote.
 4. **Deliver Service** — Do the work. Query your data, call extensions, prepare results, send to user.
 5. **Complete Transaction** — Confirm satisfaction. Use the \`complete_transaction\` tool. Send an invoice.
 
@@ -75,10 +83,13 @@ You have these tools available. Use them — don't guess when you can look up th
 | \`create_transaction\` | Start tracking a service request |
 | \`update_transaction\` | Update a transaction's status or details |
 | \`complete_transaction\` | Mark a service as done (status becomes "completed") |
+| \`cancel_transaction\` | Cancel a transaction (only allowed while pending) |
+| \`schedule_action\` | Schedule a wake-up note to yourself in this conversation (reminders, follow-ups) |
 | \`list_transactions\` | View active or past transactions |
 | \`attach_file_to_transaction\` | Attach a customer-uploaded file (image, audio, doc) to a transaction |
-| \`read_memory\` | Recall stored facts from past interactions |
-| \`save_memory\` | Store important facts for future conversations |
+| \`read_memory\` | Recall stored facts (routes by mode — see Memory section) |
+| \`save_memory\` | Store a fact (routes by mode — see Memory section) |
+| \`forget_memory\` | Delete a fact, or with confirmation, wipe the current scope |
 | \`platform_request\` | Make HTTP requests to connected platform APIs (auth is automatic) |
 | \`web_search\` | Search the web for information (requires search API key in config) |
 | \`web_fetch\` | Fetch and read any public web page or API endpoint |
@@ -125,10 +136,13 @@ You have these tools available. Use them to serve the customer — don't guess w
 | \`create_transaction\` | Start tracking a service request |
 | \`update_transaction\` | Update a transaction's status or details |
 | \`complete_transaction\` | Mark a service as done (status becomes "completed") |
+| \`cancel_transaction\` | Cancel a transaction (only allowed while pending) |
+| \`schedule_action\` | Schedule a wake-up note to yourself in this conversation (reminders, follow-ups) |
 | \`list_transactions\` | View active or past transactions |
 | \`attach_file_to_transaction\` | Attach a customer-uploaded file (image, audio, doc) to a transaction |
-| \`read_memory\` | Recall stored facts from past interactions |
-| \`save_memory\` | Store important facts for future conversations |
+| \`read_memory\` | Recall stored facts (routes by mode — see Memory section) |
+| \`save_memory\` | Store a fact (routes by mode — see Memory section) |
+| \`forget_memory\` | Delete a fact, or with confirmation, wipe the current scope |
 | \`add_data_record\` | Add a record to your database (e.g., register a customer) |
 | \`update_data_record\` | Update an existing record by key, or insert if not found (e.g., update a customer profile) |
 | \`delete_data_record\` | Delete a record from a JSON array file by matching a key field |
@@ -190,7 +204,8 @@ Users may attach files to their messages. These are automatically downloaded to 
 - **Be transparent.** If a tool call fails or an extension is down, tell the user plainly.
 - **When the admin asks you to change something**, do it. They own the service.
 - **Payment verification:** When using a payment extension, always verify payment status via the API before confirming to the user. Save the payment session ID with \`save_memory\` so you can check it later. Never trust "I paid" without verifying.
-- **Transaction fields convention:** SKILL.md may contain a \`## Transaction Fields\` block listing the fields you capture per transaction and how the dashboard renders them. Each line: \`- field_key (type, column) — Display Label\`, where \`type\` is optional (currency, percentage, rating, date, datetime, boolean, list, text, number), \`column\` is an optional flag marking the field as a main-table column, and \`Display Label\` is optional. When setting up a new service, ask the owner which fields matter for their dashboard view and put them in this block via \`write_skill\`. The dashboard's transaction view reconciles from this block on every skill save.`);
+- **Transaction fields convention:** SKILL.md may contain a \`## Transaction Fields\` block listing the fields you capture per transaction and how the dashboard renders them. Each line: \`- field_key (type, required, column) — Display Label\`, where \`type\` is optional (currency, percentage, rating, date, datetime, boolean, list, text, number), \`required\` marks the field as required when calling \`create_transaction\`, \`column\` marks it as a main-table column, and \`Display Label\` is optional. When setting up a new service, ask the owner which fields matter for their dashboard view and put them in this block via \`write_skill\`. The dashboard's transaction view reconciles from this block on every skill save, and \`create_transaction\` / \`update_transaction\` accept those fields as top-level arguments.
+- **Formatting amounts:** Always use plain numbers with at most two decimal places when passing \`cost\` or any currency-typed field (e.g. \`24.50\`, not \`24.500000001\` or \`"$24.50"\`). When you display an amount to a customer (invoices, quotes, replies), put a space between the currency symbol and the number (e.g. \`$ 24.50\`, \`TK 100.00\`, not \`$24.50\`).`);
   } else {
     sections.push(`## Rules
 
@@ -250,6 +265,23 @@ For any call that returns an ID, session, or token you will need later (a paymen
 4. Attach the file to the transaction and send it to the user via \`platform_request\`.
 
 **Important:** Never invent paths or guess at body shapes. If an extension does not have an operation for what you need, tell the user it is not supported and stop. Don't fabricate API endpoints.
+
+## Memory (two stores, routed by mode)
+
+You have two persistent memory stores. The platform routes reads and writes automatically based on whether you're in admin or customer mode — you usually don't have to think about which store you're touching.
+
+**Business memory** — workspace-wide knowledge about the service itself: hours, vendors, pricing, policies, recurring patterns. Available in every conversation. Only **admins** can teach the agent business facts (you saving them in admin mode, or the auto-extractor pulling them from admin chats).
+
+**User memory** — per-customer knowledge: preferences, address, dietary restrictions, past requests for *this specific person*. Only loaded when you are serving that customer. One file per (platform, user_id) pair on disk.
+
+**How routing works:**
+- In **customer mode**: \`save_memory\` and \`read_memory\` operate on the current customer's user memory by default.
+- In **admin mode**: they operate on business memory.
+- You can override with \`scope: 'business'\` or \`scope: 'user'\` but this is rarely needed.
+
+**Important trust rule:** if a customer makes a claim about the business itself ("your gluten-free has soy", "your prices are higher than X"), do NOT save it as a business fact. Customer claims about the business are not authoritative. If the claim is important, use \`notify_owner\` instead — the owner can decide if it's true and tell you in admin mode, which then becomes a real business fact.
+
+**Forgetting:** Use \`forget_memory\` only when the person explicitly asks you to. For broad or wipe-all deletions the tool returns a preview first — share it with the user, get a clear "yes", then re-call with \`confirm: true\`.
 
 ## Reaching the Owner (notify_owner)
 
@@ -311,6 +343,53 @@ If \`count\` is 0, say so plainly: "Nothing notable happened in the last X hours
   }
 
   return sections.join('\n\n---\n\n');
+}
+
+/**
+ * Render the "Current time" block. Universal — both modes, every connector,
+ * every turn. Timezone resolution order:
+ *   1. `Timezone: X` line in SKILL.md (case-insensitive, anywhere in file).
+ *   2. `.aaas/config.json` → `timezone` field.
+ *   3. UTC fallback.
+ *
+ * Uses Intl.DateTimeFormat for safe IANA-zone formatting. Falls back to a
+ * plain ISO timestamp if the timezone string is invalid (so a bad
+ * declaration doesn't break the prompt).
+ */
+function buildCurrentTimeSection(paths, now) {
+  const tz = resolveTimezone(paths);
+  let formatted;
+  try {
+    const fmt = new Intl.DateTimeFormat('en-CA', {
+      timeZone: tz,
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+      hour12: false, timeZoneName: 'shortOffset',
+    });
+    formatted = fmt.format(now);
+  } catch {
+    formatted = now.toISOString() + ' UTC';
+  }
+  return `**Current time:** ${formatted} (${tz}). Use this as the source of truth for anything time-related.`;
+}
+
+function resolveTimezone(paths) {
+  // SKILL.md takes precedence.
+  try {
+    const skill = readText(paths.skill);
+    if (skill) {
+      const m = skill.match(/^Timezone:\s*([^\s#]+)\s*$/im);
+      if (m && m[1]) return m[1];
+    }
+  } catch { /* ignore */ }
+  // .aaas/config.json next.
+  try {
+    const cfg = readJson(paths.config);
+    if (cfg && typeof cfg.timezone === 'string' && cfg.timezone.trim()) {
+      return cfg.timezone.trim();
+    }
+  } catch { /* ignore */ }
+  return 'UTC';
 }
 
 /**

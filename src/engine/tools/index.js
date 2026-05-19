@@ -1,7 +1,8 @@
 import { searchData } from './search-data.js';
-import { readMemory, saveMemory } from './memory.js';
+import { readMemory, saveMemory, forgetMemory } from './memory.js';
 import { callExtension } from './extensions.js';
-import { createTransaction, updateTransaction, completeTransaction, listTransactions, attachFileToTransaction } from './transactions.js';
+import { createTransaction, updateTransaction, completeTransaction, cancelTransaction, listTransactions, attachFileToTransaction } from './transactions.js';
+import { scheduleAction, removeAction, loadPending } from '../scheduler.js';
 import { readSkill, writeSkill, readSoul, writeSoul, readDataFile, writeDataFile, addDataRecord, updateDataRecord, deleteDataRecord, readExtensions, addExtension, removeExtension, importFile } from './workspace.js';
 import { runQuery, listTables } from './database.js';
 import { platformRequest } from './platform-request.js';
@@ -10,6 +11,8 @@ import { listConnections } from '../../auth/connections.js';
 import { loadConnectorToolModule } from '../../connectors/index.js';
 import { notifyOwner } from '../../notifications/index.js';
 import { MemoryManager } from '../memory/index.js';
+import { readText } from '../../utils/workspace.js';
+import { parseTransactionFieldsBlock, parseItemFieldsBlock, buildToolFieldSchema, parseServiceCatalog } from './transaction-view.js';
 
 /**
  * Tool registry. Returns tool definitions for the LLM and dispatches execution.
@@ -87,6 +90,12 @@ export class ToolRegistry {
         `Completed transaction ${args.id}${rating}`,
         { transaction_id: args.id, rating: args.rating }
       );
+    } else if (toolName === 'cancel_transaction') {
+      const reason = args.reason ? ` — ${args.reason}` : '';
+      this._logActivity('transaction_cancelled',
+        `Cancelled transaction ${args.id}${reason}`,
+        { transaction_id: args.id, reason: args.reason }
+      );
     } else if (toolName === 'notify_owner') {
       const sent = parsed.sent || [];
       if (sent.length > 0) {
@@ -94,6 +103,15 @@ export class ToolRegistry {
         this._logActivity('alert_sent',
           `Alerted owner via ${channels}: ${args.title}`,
           { alert_id: parsed.alert_id, severity: args.severity, channels }
+        );
+      }
+    } else if (toolName === 'forget_memory') {
+      // Only audit confirmed deletions (preview responses have ok:false).
+      if (parsed.ok && parsed.deleted > 0) {
+        const who = parsed.scope === 'user' ? customer : 'business';
+        this._logActivity('note',
+          `Forgot ${parsed.deleted} ${parsed.scope} fact(s) for ${who}: ${(parsed.keys || []).join(', ')}`,
+          { scope: parsed.scope, keys: parsed.keys, deleted: parsed.deleted, customer: ctx.userId }
         );
       }
     }
@@ -160,7 +178,34 @@ export class ToolRegistry {
     return [...this._getBaseToolDefinitions(), ...this.connectorDefinitions];
   }
 
+  /**
+   * Read the workspace's declared transaction fields and produce a
+   * JSON-schema fragment. Cached per skill-content hash so we only re-parse
+   * when SKILL.md actually changes. Returns `{ properties: {}, required: [] }`
+   * when no block is declared, which spreads cleanly into the base schema.
+   */
+  _getTransactionFieldSchema() {
+    try {
+      const skillText = readText(this.paths.skill) || '';
+      if (this._txnFieldCacheKey === skillText) return this._txnFieldCacheValue;
+      const parsed = parseTransactionFieldsBlock(skillText);
+      const parsedItems = parseItemFieldsBlock(skillText);
+      const schema = buildToolFieldSchema(parsed, parsedItems);
+      schema.serviceEnum = parseServiceCatalog(skillText);
+      this._txnFieldCacheKey = skillText;
+      this._txnFieldCacheValue = schema;
+      return schema;
+    } catch {
+      return { properties: {}, required: [], serviceEnum: [] };
+    }
+  }
+
   _getBaseToolDefinitions() {
+    const txnFields = this._getTransactionFieldSchema();
+    const hasDeclaredFields = Object.keys(txnFields.properties).length > 0;
+    const declaredFieldList = hasDeclaredFields
+      ? ` This service declares these fields per transaction — populate them as top-level arguments: ${Object.keys(txnFields.properties).join(', ')}.`
+      : '';
     return [
       {
         name: 'search_data',
@@ -180,24 +225,40 @@ export class ToolRegistry {
       },
       {
         name: 'read_memory',
-        description: 'Read stored facts from agent memory. Use to recall previously learned information.',
+        description: 'Read stored facts from agent memory. Routes by current mode: in customer mode you get facts about this specific customer; in admin mode you get business-wide facts. Override with `scope` only when you have a specific need.',
         parameters: {
           type: 'object',
           properties: {
-            topic: { type: 'string', description: 'Topic to filter facts by. If omitted, returns recent facts.' },
+            topic: { type: 'string', description: 'Optional substring filter. If omitted, returns recent facts.' },
+            scope: { type: 'string', enum: ['business', 'user'], description: 'Optional. Defaults to the right store for the current mode — usually you can omit this.' },
           },
         },
       },
       {
         name: 'save_memory',
-        description: 'Save a fact to persistent agent memory. Use to remember important information for future conversations.',
+        description: 'Save a fact to persistent agent memory. Routes by current mode: customer mode saves to that customer\'s memory (preferences, address, etc.); admin mode saves to business memory (hours, vendors, policies). Override with `scope` only when you have a specific reason. Do NOT save customer claims about the business — use notify_owner for those.',
         parameters: {
           type: 'object',
           properties: {
-            key: { type: 'string', description: 'Short label for the fact (e.g., "user_tom_preference").' },
+            key: { type: 'string', description: 'Short label for the fact (e.g., "spice_preference", "delivery_cutoff").' },
             value: { type: 'string', description: 'The fact to remember.' },
+            scope: { type: 'string', enum: ['business', 'user'], description: 'Optional. Defaults to the right store for the current mode — usually you can omit this.' },
           },
           required: ['key', 'value'],
+        },
+      },
+      {
+        name: 'forget_memory',
+        description: 'Delete one or more facts from memory. Routes by mode (customer mode → that customer\'s memory; admin mode → business memory). Use only when the person explicitly asks you to forget something — never for casual remarks. For broad matches or wipe-all, the tool returns a preview first and requires `confirm: true` to proceed. Customers can never delete business facts, even with scope override.',
+        parameters: {
+          type: 'object',
+          properties: {
+            key: { type: 'string', description: 'Exact key of one fact to delete.' },
+            topic: { type: 'string', description: 'Substring matched against key and value. >1 match returns a preview unless `confirm: true`.' },
+            all: { type: 'boolean', description: 'Wipe every fact in the current scope. Requires `confirm: true`.' },
+            confirm: { type: 'boolean', description: 'Required for `all` and for broad `topic` matches. Always show the preview to the user first and get explicit consent before sending confirm: true.' },
+            scope: { type: 'string', enum: ['business', 'user'], description: 'Optional. Defaults to the right store for the current mode.' },
+          },
         },
       },
       {
@@ -243,41 +304,98 @@ export class ToolRegistry {
       },
       {
         name: 'create_transaction',
-        description: 'Create a new service transaction for a user.',
+        description: 'Create a new service transaction for a user. The platform assigns the transaction number automatically — do NOT pass an id. The assigned number is returned in the response (e.g. "#47") and is what you should use for any follow-up calls (update_transaction, complete_transaction, etc.) on this order.' + declaredFieldList,
         parameters: {
           type: 'object',
           properties: {
-            id: { type: 'string', description: 'Unique transaction ID.' },
             user_id: { type: 'string', description: 'User ID or username.' },
             user_name: { type: 'string', description: 'User display name.' },
-            service: { type: 'string', description: 'Service tier name.' },
-            cost: { type: 'number', description: 'Service cost.' },
+            service: txnFields.serviceEnum?.length
+              ? { type: 'string', enum: txnFields.serviceEnum, description: 'Service from the catalog. Pick one of the declared values exactly.' }
+              : { type: 'string', description: 'Service tier name.' },
+            cost: { type: 'number', description: 'Service cost. Plain number, no currency symbol. Use at most two decimal places (e.g. 24.50, not 24.5000001).' },
             currency: { type: 'string', description: 'Currency symbol or code (e.g. $, €, TK). Defaults to $ if not specified.' },
-            details: { type: 'object', description: 'Additional transaction details.' },
+            details: { type: 'object', description: 'Additional transaction details that are not declared as top-level fields above.' },
+            ...txnFields.properties,
           },
-          required: ['id', 'user_id', 'service'],
+          // Dedupe: a declared field marked `required` in SKILL.md (e.g. `service`)
+          // would otherwise duplicate the platform-required keys. DeepSeek rejects
+          // non-unique required arrays with HTTP 400; other providers tolerate it.
+          // `id` is no longer in the schema — the engine assigns it.
+          required: [...new Set(['user_id', 'service', ...txnFields.required])],
         },
       },
       {
         name: 'update_transaction',
-        description: 'Update an existing transaction.',
+        description: 'Update an existing transaction.' + (hasDeclaredFields ? ' Pass updated values for any of the declared transaction fields directly as top-level keys, or use `updates` for fields not in the declared list.' : ''),
         parameters: {
           type: 'object',
           properties: {
             id: { type: 'string', description: 'Transaction ID.' },
-            updates: { type: 'object', description: 'Fields to update.' },
+            updates: { type: 'object', description: 'Fields to update that are not declared as top-level fields above.' },
+            ...txnFields.properties,
           },
-          required: ['id', 'updates'],
+          // `update_transaction` does not auto-require declared fields (updates
+          // are partial), so the platform keys are unique on their own — but
+          // dedupe defensively to match `create_transaction` and survive any
+          // future change that mixes the two sources.
+          required: [...new Set(['id', 'updates'])],
         },
       },
       {
         name: 'complete_transaction',
-        description: 'Mark a transaction as completed. Sets status to "completed" and records completed_at. The transaction stays visible in the dashboard until the owner archives it.',
+        description: 'Mark a transaction as completed (terminal). Call when the work is done — autonomously (you delivered the service) or after the owner confirms a hand-off. Allowed from pending, in_progress, or disputed. Refused if already completed/cancelled.',
         parameters: {
           type: 'object',
           properties: {
             id: { type: 'string', description: 'Transaction ID to complete.' },
             rating: { type: 'number', description: 'Optional rating (1-5).' },
+          },
+          required: ['id'],
+        },
+      },
+      {
+        name: 'cancel_transaction',
+        description: 'Cancel a transaction. In customer mode: allowed from `pending` or `disputed`; for `in_progress` transactions, this is REFUSED — call `notify_owner` to escalate instead. In admin mode (verified owner): allowed from any non-terminal status, including `in_progress` — the owner has dashboard-level authority. Do NOT use update_transaction to set status to "cancelled"; this dedicated tool records the reason and produces an audit log entry.',
+        parameters: {
+          type: 'object',
+          properties: {
+            id: { type: 'string', description: 'Transaction ID to cancel.' },
+            reason: { type: 'string', description: 'Optional short reason from the customer or owner.' },
+          },
+          required: ['id'],
+        },
+      },
+      {
+        name: 'schedule_action',
+        description: 'Schedule a wake-up note for yourself in this same conversation. Use when you need to do something for this customer at a later time — send a reminder, follow up on a payment link, check on a booking, etc. The action will fire after `delay_minutes` and land in this customer\'s session as a system message containing your instruction. You\'ll then react to it like any normal turn. Do not abuse — keep delays meaningful (5+ minutes) and avoid scheduling many actions for the same customer.',
+        parameters: {
+          type: 'object',
+          properties: {
+            delay_minutes: { type: 'number', description: 'Minutes from now until the action fires. Between 1 and 20160 (14 days).' },
+            instruction: { type: 'string', description: 'Note to your future self. Becomes the message you\'ll read when the action fires. Be specific — e.g. "Send Anya a reminder that her dinner reservation is in 15 minutes" rather than "remind".' },
+            context: { type: 'object', description: 'Optional structured fields to carry forward (e.g. { transaction_id, booking_time }). Surfaced in the synthetic event\'s metadata.' },
+          },
+          required: ['delay_minutes', 'instruction'],
+        },
+      },
+      {
+        name: 'list_scheduled_actions',
+        description: 'List your pending scheduled actions, optionally filtered to the current customer. Useful to check before scheduling another to avoid duplicates.',
+        parameters: {
+          type: 'object',
+          properties: {
+            this_customer_only: { type: 'boolean', description: 'When true, only return actions targeting the current session. Defaults to false.' },
+          },
+        },
+      },
+      {
+        name: 'cancel_scheduled_action',
+        description: 'Cancel a pending scheduled action by id. Use when the situation has changed (customer rescheduled, order was completed early, etc.) and the scheduled wake-up is no longer relevant.',
+        parameters: {
+          type: 'object',
+          properties: {
+            id: { type: 'string', description: 'The scheduled action id (e.g. "s_47") returned by schedule_action.' },
           },
           required: ['id'],
         },
@@ -595,9 +713,14 @@ export class ToolRegistry {
         case 'search_data':
           return await searchData(this.paths, args);
         case 'read_memory':
-          return readMemory(this.paths, args);
+          return readMemory(this.workspace, args, this.eventContext || {});
         case 'save_memory':
-          return saveMemory(this.paths, args);
+          return saveMemory(this.workspace, args, this.eventContext || {});
+        case 'forget_memory': {
+          const r = forgetMemory(this.workspace, args, this.eventContext || {});
+          this._autoLogToolResult('forget_memory', args, r);
+          return r;
+        }
         case 'call_extension':
           return await this._retryNetworkTool(() => callExtension(this.paths, args), 'call_extension');
         case 'create_transaction': {
@@ -615,10 +738,58 @@ export class ToolRegistry {
           this._autoLogToolResult('complete_transaction', args, r);
           return r;
         }
+        case 'cancel_transaction': {
+          const r = cancelTransaction(this.paths, args, this.eventContext || {});
+          this._autoLogToolResult('cancel_transaction', args, r);
+          return r;
+        }
         case 'list_transactions':
           return listTransactions(this.paths, args);
         case 'attach_file_to_transaction':
           return attachFileToTransaction(this.paths, args);
+        case 'schedule_action': {
+          // Default the target session to the current event's session so the
+          // agent doesn't have to know its own platform/userId.
+          const ctx = this.eventContext || {};
+          if (!ctx.platform || !ctx.userId) {
+            return JSON.stringify({ error: 'schedule_action requires an active conversation (no platform/userId in context).' });
+          }
+          const r = scheduleAction(this.paths, {
+            delayMinutes: args.delay_minutes,
+            instruction: args.instruction,
+            session: { platform: ctx.platform, user_id: ctx.userId, user_name: ctx.userName },
+            context: args.context,
+          });
+          if (r.error) return JSON.stringify({ error: r.error });
+          return JSON.stringify({
+            ok: true,
+            id: r.id,
+            fires_at: r.fires_at,
+            message: `Scheduled action ${r.id} to fire at ${r.fires_at}.`,
+          });
+        }
+        case 'list_scheduled_actions': {
+          const ctx = this.eventContext || {};
+          const all = loadPending(this.paths);
+          const list = args?.this_customer_only && ctx.platform && ctx.userId
+            ? all.filter(e => e.session?.platform === ctx.platform && e.session?.user_id === ctx.userId)
+            : all;
+          // Drop instructions over a length cap from listing — the agent
+          // doesn't usually need the full text again, just ids and times.
+          const slim = list.map(e => ({
+            id: e.id, fires_at: e.fires_at,
+            session: e.session,
+            instruction_preview: (e.instruction || '').slice(0, 120),
+          }));
+          return JSON.stringify({ count: slim.length, actions: slim });
+        }
+        case 'cancel_scheduled_action': {
+          if (!args?.id) return JSON.stringify({ error: 'id is required.' });
+          const ok = removeAction(this.paths, args.id);
+          return JSON.stringify(ok
+            ? { ok: true, message: `Cancelled scheduled action ${args.id}.` }
+            : { ok: false, message: `No scheduled action with id ${args.id}.` });
+        }
         case 'read_skill':
           return readSkill(this.paths);
         case 'write_skill':

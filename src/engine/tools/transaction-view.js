@@ -53,12 +53,32 @@ const DEFAULT_COLUMN_CAP = 4;
  *   { found: boolean, fields: [{ key, type, isColumn, label }] }
  */
 export function parseTransactionFieldsBlock(skillText) {
+  return parseBlockBy(skillText, /(^|\n)##\s+Transaction\s+Fields\s*\n([\s\S]*?)(?=\n##\s+|\n#\s+|$)/i);
+}
+
+/**
+ * Parse the `## Item Fields` block. Same line syntax as Transaction Fields.
+ * Used when a transaction field is declared as `object_list` — the agent then
+ * captures each item as an object whose shape is defined here.
+ *
+ *   ## Item Fields
+ *   - name (text, required)
+ *   - quantity (number, required)
+ *   - price (currency)
+ *   - notes (text, optional)
+ */
+export function parseItemFieldsBlock(skillText) {
+  return parseBlockBy(skillText, /(^|\n)##\s+Item\s+Fields\s*\n([\s\S]*?)(?=\n##\s+|\n#\s+|$)/i);
+}
+
+/**
+ * Shared parser for `## <heading>` blocks whose body is a bulleted list of
+ * field declarations. Used by both Transaction Fields and Item Fields.
+ */
+function parseBlockBy(skillText, headingRe) {
   if (!skillText || typeof skillText !== 'string') {
     return { found: false, fields: [] };
   }
-
-  // Match the heading and capture everything until the next H2 / EOF.
-  const headingRe = /(^|\n)##\s+Transaction\s+Fields\s*\n([\s\S]*?)(?=\n##\s+|\n#\s+|$)/i;
   const m = skillText.match(headingRe);
   if (!m) return { found: false, fields: [] };
 
@@ -80,24 +100,149 @@ export function parseTransactionFieldsBlock(skillText) {
 
     let type = null;
     let isColumn = false;
+    let isRequired = false;
+    let isOptional = false;
     if (parens) {
       const parts = parens.split(',').map(s => s.trim()).filter(Boolean);
       for (const p of parts) {
         if (p === 'column') isColumn = true;
+        else if (p === 'required') isRequired = true;
+        else if (p === 'optional') isOptional = true;
         else if (!type) type = p; // first non-flag token is the type
       }
     }
+    void isOptional; // required wins when both are present
 
-    fields.push({ key, type, isColumn, label });
+    fields.push({ key, type, isColumn, isRequired, label });
   }
 
   return { found: fields.length > 0, fields };
 }
 
 /**
- * Build a fresh derived config object from a parsed block. Pure function.
+ * Type mapping used when generating a JSON schema for create_transaction /
+ * update_transaction from the parsed block. Anything not listed here
+ * defaults to "string" so unknown / free-text types still work safely.
  */
-export function buildDerivedConfig(parsed) {
+const TYPE_TO_JSON_SCHEMA = {
+  currency:   { type: 'number', description_suffix: 'Numeric amount, no currency symbol; e.g. 24.50.' },
+  percentage: { type: 'number' },
+  rating:     { type: 'number' },
+  number:     { type: 'number' },
+  boolean:    { type: 'boolean' },
+  date:       { type: 'string', format: 'date' },
+  datetime:   { type: 'string', format: 'date-time' },
+  list:       { type: 'array', items: { type: 'string' } },
+  text:       { type: 'string' },
+};
+
+/**
+ * Build the JSON-schema fragment to merge into the create_transaction
+ * tool definition for this workspace.
+ *
+ * Returns { properties: {...}, required: [...] }. Empty objects when no
+ * block is parsed — caller can safely spread without conditionals.
+ *
+ * Field names are kept exactly as declared in SKILL.md so the agent's
+ * payload lands as top-level keys on the saved transaction, matching what
+ * the dashboard renders.
+ */
+export function buildToolFieldSchema(parsed, parsedItems) {
+  const out = { properties: {}, required: [] };
+  if (!parsed || !parsed.fields || parsed.fields.length === 0) return out;
+
+  // Pre-build the item object schema once if Item Fields are declared. Used
+  // wherever a transaction field has type `object_list` to constrain the
+  // per-item shape (e.g. items: [{ name, quantity, price }]).
+  const itemObjectSchema = buildItemObjectSchema(parsedItems);
+
+  for (const f of parsed.fields) {
+    const desc = f.label || prettyKey(f.key);
+    let property;
+    if (f.type === 'object_list') {
+      property = itemObjectSchema
+        ? { type: 'array', items: { ...itemObjectSchema } }
+        : { type: 'array', items: { type: 'object' } };
+      property.description = `${desc}. Each entry is an object — populate the declared sub-fields.`;
+    } else {
+      const mapped = TYPE_TO_JSON_SCHEMA[f.type] || { type: 'string' };
+      property = { ...mapped };
+      delete property.description_suffix;
+      property.description = mapped.description_suffix
+        ? `${desc}. ${mapped.description_suffix}`
+        : desc;
+    }
+    out.properties[f.key] = property;
+    if (f.isRequired) out.required.push(f.key);
+  }
+  return out;
+}
+
+/**
+ * Build the `items: { ... }` JSON-schema fragment for an `object_list` field
+ * from the parsed `## Item Fields` block. Returns null if no Item Fields are
+ * declared — caller falls back to a permissive `{ type: 'object' }`.
+ */
+function buildItemObjectSchema(parsedItems) {
+  if (!parsedItems || !parsedItems.fields || parsedItems.fields.length === 0) return null;
+  const properties = {};
+  const required = [];
+  for (const f of parsedItems.fields) {
+    const mapped = TYPE_TO_JSON_SCHEMA[f.type] || { type: 'string' };
+    const desc = f.label || prettyKey(f.key);
+    const prop = { ...mapped };
+    delete prop.description_suffix;
+    prop.description = mapped.description_suffix ? `${desc}. ${mapped.description_suffix}` : desc;
+    properties[f.key] = prop;
+    if (f.isRequired) required.push(f.key);
+  }
+  const schema = { type: 'object', properties };
+  if (required.length) schema.required = required;
+  return schema;
+}
+
+function prettyKey(k) {
+  return k.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+}
+
+/**
+ * Extract the list of declared services from SKILL.md's `## Service Catalog`
+ * section. Each `### ...` subheading under that section becomes one entry.
+ * A leading "Service N: " prefix from the template is stripped so the
+ * canonical name is what the agent actually picks.
+ *
+ * Returns an array of names (deduped, order preserved). Empty when no
+ * catalog section exists — caller treats that as "no enum, free-form."
+ */
+export function parseServiceCatalog(skillText) {
+  if (!skillText || typeof skillText !== 'string') return [];
+  const headingRe = /(^|\n)##\s+Service\s+Catalog\s*\n([\s\S]*?)(?=\n##\s+|\n#\s+|$)/i;
+  const m = skillText.match(headingRe);
+  if (!m) return [];
+  const body = m[2];
+  const names = [];
+  const seen = new Set();
+  const subRe = /^###\s+(?:Service\s*\d+\s*:\s*)?(.+?)\s*$/gm;
+  let sm;
+  while ((sm = subRe.exec(body)) !== null) {
+    const raw = sm[1].trim();
+    if (!raw) continue;
+    // Skip unfilled template placeholders like "[Name]".
+    if (/^\[.+\]$/.test(raw)) continue;
+    if (seen.has(raw)) continue;
+    seen.add(raw);
+    names.push(raw);
+  }
+  return names;
+}
+
+/**
+ * Build a fresh derived config object from a parsed block. Pure function.
+ * `parsedItems` is the optional `## Item Fields` parse — when present, the
+ * config exposes `item_fields` so the dashboard can render an Items table
+ * with the declared column order and labels.
+ */
+export function buildDerivedConfig(parsed, parsedItems) {
   if (!parsed || !parsed.fields || parsed.fields.length === 0) {
     return null;
   }
@@ -112,6 +257,17 @@ export function buildDerivedConfig(parsed) {
   for (const f of parsed.fields) {
     if (f.label) labels[f.key] = f.label;
     if (f.type && FORMAT_KEYS.has(f.type)) formats[f.key] = f.type;
+    // Item Fields also contribute formats/labels for the items sub-shape — keep
+    // them on the same maps so a single `format`/`label` lookup serves both
+    // top-level fields and item columns. Item keys (e.g. `quantity`) are
+    // unlikely to collide with top-level keys (e.g. `cost`); when they do,
+    // the top-level field wins (already set above).
+  }
+  if (parsedItems && Array.isArray(parsedItems.fields)) {
+    for (const f of parsedItems.fields) {
+      if (f.label && !labels[f.key]) labels[f.key] = f.label;
+      if (f.type && FORMAT_KEYS.has(f.type) && !formats[f.key]) formats[f.key] = f.type;
+    }
   }
 
   const detailSections = [{
@@ -119,12 +275,23 @@ export function buildDerivedConfig(parsed) {
     fields: parsed.fields.map(f => f.key),
   }];
 
-  return {
+  const out = {
     table_columns: tableColumns,
     detail_sections: detailSections,
     labels,
     formats,
   };
+
+  if (parsedItems && Array.isArray(parsedItems.fields) && parsedItems.fields.length) {
+    out.item_fields = parsedItems.fields.map(f => ({
+      key: f.key,
+      type: f.type || null,
+      required: !!f.isRequired,
+      label: f.label || null,
+    }));
+  }
+
+  return out;
 }
 
 /**
@@ -165,7 +332,16 @@ export function mergeWithOverrides(derived, overrides) {
   const labels = { ...(d.labels || {}), ...(o.labels || {}) };
   const formats = { ...(d.formats || {}), ...(o.formats || {}) };
 
-  return { table_columns: tableColumns, detail_sections: detailSections, labels, formats };
+  // ── item_fields ──
+  // Pass-through from derived. Owner overrides do not currently touch item
+  // field shape — the contract is "SKILL.md owns item structure." Future
+  // enhancement could add per-item column hide/reorder overrides, mirroring
+  // the table_columns/column_order pattern.
+  const out = { table_columns: tableColumns, detail_sections: detailSections, labels, formats };
+  if (Array.isArray(d.item_fields) && d.item_fields.length) {
+    out.item_fields = d.item_fields;
+  }
+  return out;
 }
 
 /**
@@ -223,11 +399,12 @@ function persistLayered(paths, { derived, overrides }) {
  */
 export function reconcileFromSkill(paths, skillText) {
   const parsed = parseTransactionFieldsBlock(skillText);
+  const parsedItems = parseItemFieldsBlock(skillText);
   const { derived: prevDerived, overrides } = loadLayered(paths);
 
   let nextDerived = prevDerived;
   if (parsed.found) {
-    nextDerived = buildDerivedConfig(parsed);
+    nextDerived = buildDerivedConfig(parsed, parsedItems);
   }
 
   // If there's nothing on disk and no block in skill, do nothing — the
@@ -279,4 +456,76 @@ function sanitizeOverrides(o) {
  */
 export function readLayered(paths) {
   return loadLayered(paths);
+}
+
+/**
+ * Exact field signature of the unmodified template block shipped with
+ * `aaas init`. If a workspace's parsed block matches this signature, treat
+ * it as "still scaffolding" — i.e. the admin has not customized the schema.
+ *
+ * Kept in sync with templates/workspace/skills/aaas/SKILL.md. If the template
+ * changes, add the new signature to this list rather than replacing — older
+ * workspaces should still be recognized.
+ */
+const TEMPLATE_DEFAULT_SIGNATURES = [
+  // v1 — original template fields
+  [
+    { key: 'service',    isRequired: true,  isColumn: true,  type: null },
+    { key: 'status',     isRequired: false, isColumn: true,  type: null },
+    { key: 'cost',       isRequired: true,  isColumn: true,  type: 'currency' },
+    { key: 'created_at', isRequired: false, isColumn: false, type: 'datetime' },
+  ],
+];
+
+/**
+ * Returns true if the parsed block is the unmodified template scaffolding.
+ * Used by the seeding layer to decide whether to propose a real schema.
+ */
+export function isTemplateDefault(parsed) {
+  if (!parsed || !parsed.found || !Array.isArray(parsed.fields)) return false;
+  return TEMPLATE_DEFAULT_SIGNATURES.some(sig => signatureMatches(sig, parsed.fields));
+}
+
+function signatureMatches(sig, fields) {
+  if (sig.length !== fields.length) return false;
+  for (let i = 0; i < sig.length; i++) {
+    const a = sig[i];
+    const b = fields[i];
+    if (a.key !== b.key) return false;
+    if (!!a.isRequired !== !!b.isRequired) return false;
+    if (!!a.isColumn !== !!b.isColumn) return false;
+    if ((a.type || null) !== (b.type || null)) return false;
+  }
+  return true;
+}
+
+/**
+ * Locate the `## Transaction Fields` block in SKILL.md and return its byte
+ * span plus the body text. Returns null when no such heading exists.
+ *
+ * The span runs from the `##` line through (but not including) the next H2/H1
+ * heading or EOF. Trailing horizontal-rule (`---`) lines are excluded so the
+ * caller can replace the block cleanly without disturbing section separators.
+ */
+export function findTransactionFieldsSpan(skillText) {
+  if (!skillText || typeof skillText !== 'string') return null;
+  const headingRe = /(^|\n)(##\s+Transaction\s+Fields\s*\n)([\s\S]*?)(?=\n##\s+|\n#\s+|$)/i;
+  const m = headingRe.exec(skillText);
+  if (!m) return null;
+
+  const leading = m[1] || '';
+  const headingStart = m.index + leading.length;
+  let blockEnd = m.index + m[0].length;
+
+  // Trim trailing blank lines + horizontal rule so we replace only the
+  // section content, not the separator that follows it.
+  const tail = skillText.slice(headingStart, blockEnd);
+  const trimmed = tail.replace(/\n+\s*-{3,}\s*$/, '').replace(/\s+$/, '');
+  blockEnd = headingStart + trimmed.length;
+
+  return {
+    start: headingStart,
+    end: blockEnd,
+    body: m[3],
+  };
 }
