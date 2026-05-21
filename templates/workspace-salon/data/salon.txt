@@ -1,0 +1,5 @@
+Welcome to {{SALON_SHORT}} — your spot for {{SPECIALTIES}}.
+
+⏰ Open daily: {{HOURS_DAILY}}
+📞 Bookings: {{PHONE}}
+📍 {{REGION}}

@@ -15,8 +15,10 @@ function nameColor(name) {
 
 export default function Hub() {
   const { data, loading, error, refetch } = useFetch('/api/hub/workspaces');
+  const { data: templatesData } = useFetch('/api/hub/templates');
   const api = useApi();
   const [creating, setCreating] = useState(false);
+  const [selectedTemplate, setSelectedTemplate] = useState(''); // '' = Blank
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
   const [photo, setPhoto] = useState(null);
@@ -118,6 +120,8 @@ export default function Hub() {
       formData.append('name', name.trim());
       formData.append('description', description.trim());
       if (photo) formData.append('photo', photo);
+      // Empty selectedTemplate = Blank (existing generic scaffold behavior)
+      if (selectedTemplate) formData.append('template', selectedTemplate);
       const resp = await fetch('/api/hub/workspaces', { method: 'POST', body: formData });
       const result = await resp.json();
       if (!resp.ok) throw new Error(result.error || 'Failed');
@@ -126,6 +130,16 @@ export default function Hub() {
       setFormError(err.message);
     }
     setSaving(false);
+  };
+
+  const resetCreateForm = () => {
+    setCreating(false);
+    setFormError('');
+    setSelectedTemplate('');
+    setName('');
+    setDescription('');
+    setPhoto(null);
+    setPhotoPreview(null);
   };
 
   return (
@@ -139,43 +153,81 @@ export default function Hub() {
         {!creating ? (
           <button className="btn btn-primary" onClick={() => setCreating(true)}>+ New Agent</button>
         ) : (
-          <div className="card" style={{ maxWidth: 500 }}>
+          <div className="card" style={{ maxWidth: 880 }}>
             <div className="card-header">Create New Agent</div>
-            <div className="card-body">
-              <div className="form-group">
-                <label>Agent Name</label>
-                <input type="text" value={name} onChange={e => setName(e.target.value)} className="form-input" placeholder="e.g. My Travel Agent" autoFocus />
-              </div>
-              <div className="form-group">
-                <label>Description</label>
-                <textarea value={description} onChange={e => setDescription(e.target.value)} className="form-input" rows={3} placeholder="What service does this agent provide?" />
-              </div>
-              <div className="form-group">
-                <label>Photo <span style={{ color: 'var(--text-muted)', fontWeight: 400 }}>(optional)</span></label>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 4 }}>
-                  {photoPreview ? (
-                    <img src={photoPreview} alt="Preview" style={{ width: 48, height: 48, borderRadius: 10, objectFit: 'cover' }} />
-                  ) : (
-                    <div style={{ width: 48, height: 48, borderRadius: 10, background: 'var(--bg-input)', border: '1px dashed var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-muted)', fontSize: 18 }}>
-                      {name.trim() ? name.trim().charAt(0).toUpperCase() : '?'}
-                    </div>
-                  )}
-                  <div>
-                    <label className="btn btn-sm" style={{ cursor: 'pointer' }}>
-                      Choose image
-                      <input type="file" accept="image/*" onChange={handlePhotoChange} style={{ display: 'none' }} />
-                    </label>
-                    {photo && (
-                      <button className="btn btn-sm" style={{ marginLeft: 6 }} onClick={() => { setPhoto(null); setPhotoPreview(null); }}>Remove</button>
-                    )}
-                  </div>
+            <div className="card-body" style={{ display: 'grid', gridTemplateColumns: '260px 1fr', gap: 0, padding: 0 }}>
+
+              {/* Left: template gallery — tinted background to visually
+                  separate from the form on the right. */}
+              <div
+                style={{
+                  background: 'var(--bg-input)',
+                  borderRight: '1px solid var(--border-subtle)',
+                  padding: '18px 16px',
+                }}
+              >
+                <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 10 }}>
+                  Start with
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  <TemplateCard
+                    selected={selectedTemplate === ''}
+                    onSelect={() => setSelectedTemplate('')}
+                    name="Blank"
+                    description="Start with a generic agent — write your own skill from scratch."
+                    icon={<BlankIcon />}
+                  />
+                  {(templatesData?.templates || []).map(t => (
+                    <TemplateCard
+                      key={t.type}
+                      selected={selectedTemplate === t.type}
+                      onSelect={() => setSelectedTemplate(t.type)}
+                      name={t.name}
+                      description={t.description}
+                      imageSrc={t.hasImage ? `/api/hub/templates/${t.type}/preview` : null}
+                    />
+                  ))}
                 </div>
               </div>
-              {formError && <p className="form-hint" style={{ color: 'var(--red)' }}>{formError}</p>}
-              <div className="form-actions" style={{ display: 'flex', gap: 8 }}>
-                <button className="btn btn-primary" onClick={handleCreate} disabled={saving}>{saving ? 'Creating...' : 'Create'}</button>
-                <button className="btn" onClick={() => { setCreating(false); setFormError(''); setPhoto(null); setPhotoPreview(null); }}>Cancel</button>
+
+              {/* Right: agent details form */}
+              <div style={{ padding: '18px 18px 18px 20px' }}>
+                <div className="form-group">
+                  <label>Agent Name</label>
+                  <input type="text" value={name} onChange={e => setName(e.target.value)} className="form-input" placeholder="e.g. Mario's Pizza" autoFocus />
+                </div>
+                <div className="form-group">
+                  <label>Description</label>
+                  <textarea value={description} onChange={e => setDescription(e.target.value)} className="form-input" rows={3} placeholder="What service does this agent provide?" />
+                </div>
+                <div className="form-group">
+                  <label>Photo <span style={{ color: 'var(--text-muted)', fontWeight: 400 }}>(optional)</span></label>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 4 }}>
+                    {photoPreview ? (
+                      <img src={photoPreview} alt="Preview" style={{ width: 48, height: 48, borderRadius: 10, objectFit: 'cover' }} />
+                    ) : (
+                      <div style={{ width: 48, height: 48, borderRadius: 10, background: 'var(--bg-input)', border: '1px dashed var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-muted)', fontSize: 18 }}>
+                        {name.trim() ? name.trim().charAt(0).toUpperCase() : '?'}
+                      </div>
+                    )}
+                    <div>
+                      <label className="btn btn-sm" style={{ cursor: 'pointer' }}>
+                        Choose image
+                        <input type="file" accept="image/*" onChange={handlePhotoChange} style={{ display: 'none' }} />
+                      </label>
+                      {photo && (
+                        <button className="btn btn-sm" style={{ marginLeft: 6 }} onClick={() => { setPhoto(null); setPhotoPreview(null); }}>Remove</button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+                {formError && <p className="form-hint" style={{ color: 'var(--red)' }}>{formError}</p>}
+                <div className="form-actions" style={{ display: 'flex', gap: 8 }}>
+                  <button className="btn btn-primary" onClick={handleCreate} disabled={saving}>{saving ? 'Creating...' : 'Create'}</button>
+                  <button className="btn" onClick={resetCreateForm}>Cancel</button>
+                </div>
               </div>
+
             </div>
           </div>
         )}
@@ -404,5 +456,71 @@ export default function Hub() {
         </>
       )}
     </div>
+  );
+}
+
+/**
+ * Template card shown in the New Agent gallery. Click to select.
+ * `imageSrc` renders a real preview thumbnail; `icon` is a fallback for
+ * cards without an image (currently used by the Blank card).
+ */
+function TemplateCard({ selected, onSelect, name, description, imageSrc, icon }) {
+  return (
+    <button
+      type="button"
+      onClick={onSelect}
+      style={{
+        textAlign: 'left',
+        padding: 10,
+        borderRadius: 10,
+        background: selected ? 'var(--accent-muted)' : 'var(--bg-card)',
+        border: `1px solid ${selected ? 'var(--accent)' : 'var(--border)'}`,
+        cursor: 'pointer',
+        display: 'flex',
+        gap: 10,
+        alignItems: 'flex-start',
+        transition: 'background 0.15s ease, border-color 0.15s ease',
+        font: 'inherit',
+        color: 'inherit',
+      }}
+    >
+      <div
+        style={{
+          width: 44,
+          height: 44,
+          borderRadius: 8,
+          background: 'var(--bg-input)',
+          flexShrink: 0,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          overflow: 'hidden',
+          border: '1px solid var(--border-subtle)',
+        }}
+      >
+        {imageSrc ? (
+          <img src={imageSrc} alt={name} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+        ) : (
+          icon
+        )}
+      </div>
+      <div style={{ minWidth: 0 }}>
+        <div style={{ fontWeight: 600, fontSize: 13, color: 'var(--text)' }}>{name}</div>
+        {description && (
+          <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2, lineHeight: 1.4 }}>
+            {description}
+          </div>
+        )}
+      </div>
+    </button>
+  );
+}
+
+function BlankIcon() {
+  return (
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" style={{ color: 'var(--text-muted)' }}>
+      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+      <polyline points="14 2 14 8 20 8" />
+    </svg>
   );
 }

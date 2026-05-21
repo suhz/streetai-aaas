@@ -1,0 +1,6 @@
+{
+  "name": "Shop",
+  "description": "Product catalog, orders, and delivery. Built for small shops, boutiques, and online stores.",
+  "image": "preview.png",
+  "type": "shop"
+}

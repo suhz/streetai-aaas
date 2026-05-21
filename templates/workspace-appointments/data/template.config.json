@@ -1,0 +1,21 @@
+{
+  "template": "appointments",
+  "description": "Variables the agent walks the owner through on first admin chat. The agent collects answers then calls apply_template_variables to substitute them across files_to_substitute. Mark complete by overwriting this file with { completed: true, completed_at: ... }.",
+  "auto_fill_from_workspace_name": ["BUSINESS_NAME", "BUSINESS_SHORT", "AGENT_NAME"],
+  "variables": [
+    { "key": "BUSINESS_TYPE", "prompt": "What kind of business is this? (e.g. 'plumbing', 'dental clinic', 'photography', 'tutoring')", "required": true },
+    { "key": "WHAT_YOU_DO", "prompt": "One-line description of what you do for customers (e.g. 'fix leaky pipes and emergency plumbing', 'general dentistry and orthodontics')", "required": true },
+    { "key": "REGION", "prompt": "Country or city you serve (e.g. 'UAE', 'Greater Boston')", "required": true },
+    { "key": "CURRENCY", "prompt": "Currency code for any pricing (3 letters: AED, USD, EUR, GBP...)", "required": true, "validate": "^[A-Z]{3}$" },
+    { "key": "HOURS_DAILY", "prompt": "Daily hours when you take appointments (e.g. '8:00 AM – 5:00 PM, Mon–Sat')", "required": true },
+    { "key": "PHONE", "prompt": "Booking phone number (with country code)", "required": true },
+    { "key": "LOCATION_MODEL", "prompt": "Do you visit the customer, or do they come to you? (e.g. 'we visit you', 'at our office', 'both')", "default": "both" },
+    { "key": "SIGN_OFF", "prompt": "Closing line in the agent's voice (e.g. 'See you soon!')", "default": "Thanks — talk soon!" }
+  ],
+  "files_to_substitute": [
+    "skills/aaas/SKILL.md",
+    "SOUL.md",
+    "data/business.txt",
+    "data/background.txt"
+  ]
+}

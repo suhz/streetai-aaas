@@ -1,0 +1,31 @@
+{
+  "template": "restaurant",
+  "description": "Variables the agent walks the owner through on first admin chat. The agent collects answers then calls apply_template_variables to substitute them across files_to_substitute. Mark complete by overwriting this file with { completed: true, completed_at: ... }.",
+  "auto_fill_from_workspace_name": ["RESTAURANT_NAME", "RESTAURANT_SHORT", "AGENT_NAME"],
+  "variables": [
+    { "key": "AGENT_NAME", "prompt": "What should the agent call itself in chat? (e.g. 'CP', 'Maya')", "required": true },
+    { "key": "CUISINE_LONG", "prompt": "Cuisine — full descriptor (e.g. 'Malabar / Kerala coastal', 'Neapolitan pizza', 'Levantine')", "required": true },
+    { "key": "CUISINE_SHORT", "prompt": "Cuisine — short label for tagline (e.g. 'Malabar', 'Italian')", "required": true },
+    { "key": "REGION", "prompt": "Country or region you operate in (e.g. 'UAE', 'New York')", "required": true },
+    { "key": "LANGUAGES", "prompt": "Languages the agent should speak (e.g. 'English', 'English, Arabic')", "default": "English" },
+    { "key": "CURRENCY", "prompt": "Currency code (3 letters: AED, USD, EUR, GBP, INR...)", "required": true, "validate": "^[A-Z]{3}$" },
+    { "key": "LOCATION", "prompt": "Location phrase (e.g. 'in the heart of Dubai Marina', 'on Main Street downtown')", "required": true },
+    { "key": "HOURS_DAILY", "prompt": "Daily operating hours (e.g. '11:00 AM – 11:00 PM')", "required": true },
+    { "key": "HOURS_LUNCH", "prompt": "Lunch service hours (e.g. '11:00 AM – 3:00 PM') — for table bookings", "required": true },
+    { "key": "HOURS_DINNER", "prompt": "Dinner service hours (e.g. '6:00 PM – 10:30 PM') — for table bookings", "required": true },
+    { "key": "PHONE", "prompt": "Reservation phone number (with country code)", "required": true },
+    { "key": "WEBSITE", "prompt": "Website URL (optional, can be 'none')", "default": "none" },
+    { "key": "DIETARY_NOTES", "prompt": "Dietary positioning (e.g. 'Halal. Vegetarian options available.', 'Kosher', 'Vegan-friendly')", "default": "Vegetarian options available." },
+    { "key": "HERITAGE", "prompt": "Heritage line (e.g. '85-year culinary legacy', 'family-run since 1998', 'new this year')", "default": "Family-run kitchen with care for every plate." },
+    { "key": "TAGLINE", "prompt": "One-sentence tagline that captures your food's vibe", "required": true },
+    { "key": "SIGN_OFF", "prompt": "Closing line in the agent's voice (e.g. 'Nanni! Enjoy! 🍛', 'Grazie! Buon appetito! 🍝')", "default": "Thank you! Enjoy! 🍽️" },
+    { "key": "MENU_CATEGORIES", "prompt": "Menu categories, comma-separated (e.g. 'Starters, Mains, Desserts, Drinks')", "required": true },
+    { "key": "DELIVERY_AREAS_EXAMPLE", "prompt": "Example delivery areas, comma-separated (used as a prompt for customers, e.g. 'Al Karama, Jumeirah, Deira')", "default": "your area, your neighborhood" }
+  ],
+  "files_to_substitute": [
+    "skills/aaas/SKILL.md",
+    "SOUL.md",
+    "data/restaurant.txt",
+    "data/background.txt"
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "name": "Restaurant",
+  "description": "Menu exploration, food orders (dine-in / takeout / delivery), and table bookings. Built for restaurants and cafés.",
+  "image": "preview.png",
+  "type": "restaurant"
+}

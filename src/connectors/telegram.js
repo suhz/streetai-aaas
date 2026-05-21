@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { BaseConnector } from './index.js';
+import { BaseConnector, clearPausedSessionsForPlatform } from './index.js';
 import { readFileBuffer } from './media.js';
 import { writePlatformSkill } from '../utils/workspace.js';
 import { findAlertByChannelMessage, getRecentOpenAlerts } from '../notifications/alerts.js';
@@ -86,6 +86,15 @@ export default class TelegramConnector extends BaseConnector {
     this.error = null;
     this.polling = true;
     this.pollFailures = 0;
+
+    // Pause state does not survive a connector restart. Sweep here so any
+    // sessions left paused at shutdown come back online with the agent.
+    // Best-effort: the helper swallows its own errors.
+    try {
+      const cleared = clearPausedSessionsForPlatform(this.engine?.sessionManager, 'telegram');
+      if (cleared > 0) console.log(`[telegram] Resumed ${cleared} paused session(s) on connect.`);
+    } catch { /* never block connect */ }
+
     this._poll();
   }
 
@@ -526,5 +535,47 @@ export default class TelegramConnector extends BaseConnector {
 
   _sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
+  }
+}
+
+/**
+ * Static "send arbitrary text to a Telegram chat" helper.
+ *
+ * Used by the dashboard's admin-intervention path so it can deliver an
+ * admin-authored message directly to the customer without needing a live
+ * connector instance — works whether this process is the daemon or the
+ * dashboard. Reads the bot token from the workspace's connection config.
+ *
+ * Returns `{ ok: true }` on success or `{ ok: false, error }` on failure.
+ * Does NOT split messages (callers can split if needed for >4096 chars).
+ */
+export async function sendDirect(workspace, chatId, text) {
+  const conn = loadConnection(workspace, 'telegram');
+  if (!conn?.botToken) {
+    return { ok: false, error: 'Telegram is not connected for this workspace.' };
+  }
+  if (!chatId || !String(chatId).trim()) {
+    return { ok: false, error: 'chat_id is required.' };
+  }
+  if (!text || !String(text).trim()) {
+    return { ok: false, error: 'text is required.' };
+  }
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${conn.botToken}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: String(chatId),
+        text: String(text),
+        parse_mode: 'Markdown',
+      }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok || body.ok === false) {
+      return { ok: false, error: body.description || `Telegram API HTTP ${res.status}` };
+    }
+    return { ok: true, message_id: body.result?.message_id };
+  } catch (err) {
+    return { ok: false, error: err.message };
   }
 }

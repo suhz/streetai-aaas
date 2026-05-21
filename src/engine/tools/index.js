@@ -3,7 +3,7 @@ import { readMemory, saveMemory, forgetMemory } from './memory.js';
 import { callExtension } from './extensions.js';
 import { createTransaction, updateTransaction, completeTransaction, cancelTransaction, listTransactions, attachFileToTransaction } from './transactions.js';
 import { scheduleAction, removeAction, loadPending } from '../scheduler.js';
-import { readSkill, writeSkill, readSoul, writeSoul, readDataFile, writeDataFile, addDataRecord, updateDataRecord, deleteDataRecord, readExtensions, addExtension, removeExtension, importFile } from './workspace.js';
+import { readSkill, writeSkill, readSoul, writeSoul, readDataFile, writeDataFile, addDataRecord, updateDataRecord, deleteDataRecord, readExtensions, addExtension, removeExtension, importFile, applyTemplateVariables, renameDataFile } from './workspace.js';
 import { runQuery, listTables } from './database.js';
 import { platformRequest } from './platform-request.js';
 import { webSearch, webFetch } from './web.js';
@@ -12,7 +12,8 @@ import { loadConnectorToolModule } from '../../connectors/index.js';
 import { notifyOwner } from '../../notifications/index.js';
 import { MemoryManager } from '../memory/index.js';
 import { readText } from '../../utils/workspace.js';
-import { parseTransactionFieldsBlock, parseItemFieldsBlock, buildToolFieldSchema, parseServiceCatalog } from './transaction-view.js';
+import { parseTransactionFieldsBlock, parseItemFieldsBlock, buildToolFieldSchema, parseServiceCatalog, parseCurrencyDeclaration } from './transaction-view.js';
+import { validateTransactionPayload } from './transaction-validate.js';
 
 /**
  * Tool registry. Returns tool definitions for the LLM and dispatches execution.
@@ -197,6 +198,29 @@ export class ToolRegistry {
       return schema;
     } catch {
       return { properties: {}, required: [], serviceEnum: [] };
+    }
+  }
+
+  /**
+   * Returns the parsed Transaction Fields + Item Fields blocks (not the JSON
+   * schema), plus the workspace's `Currency:` declaration if present.
+   * Used by engine-side validation, which needs the `isRequired` flags,
+   * the field type, and the currency allow-list rather than the LLM-shaped
+   * schema. Cached against the same skill content hash as the schema cache.
+   */
+  _getParsedTransactionFields() {
+    try {
+      const skillText = readText(this.paths.skill) || '';
+      if (this._txnParsedCacheKey === skillText) return this._txnParsedCacheValue;
+      const parsed = parseTransactionFieldsBlock(skillText);
+      const parsedItems = parseItemFieldsBlock(skillText);
+      const currencyDecl = parseCurrencyDeclaration(skillText);
+      const value = { parsed, parsedItems, currencyDecl };
+      this._txnParsedCacheKey = skillText;
+      this._txnParsedCacheValue = value;
+      return value;
+    } catch {
+      return { parsed: { found: false, fields: [] }, parsedItems: { found: false, fields: [] }, currencyDecl: null };
     }
   }
 
@@ -440,6 +464,37 @@ export class ToolRegistry {
             content: { type: 'string', description: 'The full SKILL.md content (markdown).' },
           },
           required: ['content'],
+        },
+      },
+      {
+        name: 'rename_data_file',
+        description: 'Rename or move a file inside data/. Use when a file is on disk under one name but other files (menu.json, etc.) reference a different name.',
+        parameters: {
+          type: 'object',
+          properties: {
+            from: { type: 'string', description: 'Current path, relative to data/.' },
+            to:   { type: 'string', description: 'New path, relative to data/.' },
+          },
+          required: ['from', 'to'],
+        },
+      },
+      {
+        name: 'apply_template_variables',
+        description: 'Mechanically substitute {{KEY}} placeholders across template files during first-time workspace setup. Reads data/template.config.json for the files_to_substitute list and replaces every {{KEY}} occurrence with the provided value. Preserves frontmatter, formatting, and structure exactly — use this INSTEAD of read_skill/write_skill loops when filling in a fresh template. Returns the substitution count per file and any placeholders that remain unfilled.',
+        parameters: {
+          type: 'object',
+          properties: {
+            values: {
+              type: 'object',
+              description: 'Map of variable name to substituted value. Example: { "RESTAURANT_NAME": "Mario\'s Pizza", "CURRENCY": "USD" }. Keys MUST match those listed in data/template.config.json.',
+            },
+            files: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Optional override list of files (workspace-root-relative). When omitted, the tool reads data/template.config.json and uses its files_to_substitute array.',
+            },
+          },
+          required: ['values'],
         },
       },
       {
@@ -724,11 +779,27 @@ export class ToolRegistry {
         case 'call_extension':
           return await this._retryNetworkTool(() => callExtension(this.paths, args), 'call_extension');
         case 'create_transaction': {
-          const r = createTransaction(this.paths, args);
-          this._autoLogToolResult('create_transaction', args, r);
+          const { parsed, parsedItems, currencyDecl } = this._getParsedTransactionFields();
+          const v = validateTransactionPayload(args, parsed, parsedItems, { mode: 'create', currencyDecl });
+          if (!v.ok) return JSON.stringify({ error: v.error });
+          // Stamp the customer session location onto the row so the dashboard
+          // can later read/inject into the right session for admin messaging.
+          // Lands as a top-level field via createTransaction's customFields spread.
+          // When SKILL.md declares a Currency, use its default in place of
+          // the engine's hardcoded `$` when the agent omits currency.
+          const argsWithDefaults = {
+            ...args,
+            session_platform: args.session_platform || this.eventContext?.platform || null,
+            currency: args.currency || currencyDecl?.default || args.currency,
+          };
+          const r = createTransaction(this.paths, argsWithDefaults);
+          this._autoLogToolResult('create_transaction', argsWithDefaults, r);
           return r;
         }
         case 'update_transaction': {
+          const { parsed, parsedItems, currencyDecl } = this._getParsedTransactionFields();
+          const v = validateTransactionPayload(args, parsed, parsedItems, { mode: 'update', currencyDecl });
+          if (!v.ok) return JSON.stringify({ error: v.error });
           const r = updateTransaction(this.paths, args);
           this._autoLogToolResult('update_transaction', args, r);
           return r;
@@ -794,6 +865,10 @@ export class ToolRegistry {
           return readSkill(this.paths);
         case 'write_skill':
           return writeSkill(this.paths, args);
+        case 'apply_template_variables':
+          return applyTemplateVariables(this.paths, args);
+        case 'rename_data_file':
+          return renameDataFile(this.paths, args);
         case 'read_soul':
           return readSoul(this.paths);
         case 'write_soul':

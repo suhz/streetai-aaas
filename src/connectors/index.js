@@ -151,6 +151,68 @@ export async function loadConnectorToolModule(platform) {
 }
 
 /**
+ * Dispatch an admin-authored direct message to a customer on the given
+ * platform. Looks up the platform's connector module via the existing
+ * CONNECTOR_MODULES registry and calls its named `sendDirect` export.
+ *
+ * Used by the dashboard's intervention endpoint (POST /transactions/:id/
+ * admin-message). The agent is NOT involved — this is a direct
+ * platform-API call using the connection credentials stored on disk.
+ *
+ * @returns {Promise<{ok:true,message_id?:string}|{ok:false,error:string}>}
+ */
+export async function sendDirectToCustomer(workspace, platform, recipient, text) {
+  const loader = CONNECTOR_MODULES[platform];
+  if (!loader) {
+    return { ok: false, error: `Unknown platform "${platform}".` };
+  }
+  let mod;
+  try {
+    mod = await loader();
+  } catch (err) {
+    return { ok: false, error: `Failed to load connector module for "${platform}": ${err.message}` };
+  }
+  if (typeof mod.sendDirect !== 'function') {
+    return { ok: false, error: `Direct admin intervention is not implemented for "${platform}" yet.` };
+  }
+  try {
+    return await mod.sendDirect(workspace, recipient, text);
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
+/**
+ * Sweep paused-session flags for a given platform. Called by a connector
+ * when it starts up — the policy is that pause state does not survive a
+ * restart, since the admin can't see the dashboard while everything's down
+ * and shouldn't be left with a silent agent on resume.
+ *
+ * Best-effort: failures here must never break connector startup.
+ *
+ * @param {object} sessionManager - The engine's SessionManager.
+ * @param {string} platform - Platform name to sweep (e.g. 'telegram').
+ * @returns {number} Count of sessions that had pause cleared.
+ */
+export function clearPausedSessionsForPlatform(sessionManager, platform) {
+  if (!sessionManager?.listSessions) return 0;
+  let cleared = 0;
+  try {
+    for (const s of sessionManager.listSessions()) {
+      if (s.platformId !== platform) continue;
+      if (s.meta?.paused) {
+        sessionManager.setSessionMeta(platform, s.userId, 'paused', null);
+        sessionManager.setSessionMeta(platform, s.userId, 'paused_at', null);
+        cleared++;
+      }
+    }
+  } catch (err) {
+    console.warn(`[connectors] Pause sweep failed for "${platform}":`, err.message);
+  }
+  return cleared;
+}
+
+/**
  * Load and instantiate all configured connectors for a workspace.
  * When a relay connection exists, skip starting local servers for
  * whatsapp and http — the relay connector handles their traffic.

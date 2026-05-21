@@ -89,7 +89,21 @@ npm install -g @streetai/aaas
 
 Requires Node.js 18 or later.
 
-### Create an agent
+### Start from a template (recommended)
+
+The fastest way to get a working agent is to start from a built-in template. Open the dashboard hub, click **+ New Agent**, pick a template card on the left, fill in the name and description, then Create.
+
+Templates available:
+
+- **Restaurant** for menu, orders, and table bookings
+- **Salon** for service catalogs and appointments
+- **Shop** for product catalogs and orders
+- **Appointments** for clinics, repair shops, tutors, and similar service businesses
+- **Blank** for a fully custom agent (the original behavior)
+
+After creation, open the workspace's **Chat** tab in admin mode and say something like "set up the restaurant". The agent reads `data/template.config.json`, walks you through about six questions about your business, and substitutes the answers across the template files. From there you add menu items, products, or services using the Data tab or by chatting with the agent.
+
+### Create an agent from the CLI
 
 **Syntax:**
 
@@ -97,10 +111,10 @@ Requires Node.js 18 or later.
 aaas init <directory> [name] [description] [--type service|social]
 ```
 
-- `<directory>` — folder name where the workspace will be created
-- `[name]` — display name shown to users (optional, can be edited later)
-- `[description]` — one-line summary (optional, can be edited later)
-- `--type` — `service` (default, follows the transaction protocol) or `social` (creates content and engages in conversations)
+- `<directory>` is the folder name where the workspace will be created
+- `[name]` is the display name shown to users (optional, can be edited later)
+- `[description]` is a one-line summary (optional, can be edited later)
+- `--type` is `service` (default, follows the transaction protocol) or `social` (creates content and engages in conversations)
 
 **Examples:**
 

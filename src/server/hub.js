@@ -3,10 +3,17 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import multer from 'multer';
+import { fileURLToPath } from 'url';
 import { readJson, readText, writeJson, listFiles } from '../utils/workspace.js';
 import { getProviderCredential, setProviderCredential, removeProviderCredential, listProviders, maskApiKey } from '../auth/credentials.js';
 import { getValidWorkspaces, registerWorkspace, unregisterWorkspace } from '../utils/registry.js';
 import { getConnectorStatus, hasRunningConnector } from './connector-registry.js';
+
+const __hub_dirname = path.dirname(fileURLToPath(import.meta.url));
+// Templates ship with the package at <root>/templates/. Each subdirectory
+// matching `workspace-<type>/` is a template; the bare `workspace/` is the
+// generic scaffold and is not exposed as a selectable template.
+const TEMPLATES_DIR = path.join(__hub_dirname, '..', '..', 'templates');
 
 export function hubRouter(hubDir) {
   const router = express.Router();
@@ -265,8 +272,135 @@ export function hubRouter(hubDir) {
     res.status(404).end();
   });
 
+  // ─── Templates ──────────────────────────────────────
+  //
+  // Templates live in <package>/templates/workspace-<type>/. Each one
+  // ships a template.json with display metadata for the gallery, plus
+  // the workspace files (with {{VAR}} placeholders the agent walks the
+  // owner through after creation).
+
+  /**
+   * Scan the templates directory and return an array of available
+   * templates. The bare `workspace/` (generic scaffold) is excluded —
+   * "Blank" is rendered client-side as the default option.
+   */
+  function discoverTemplates() {
+    if (!fs.existsSync(TEMPLATES_DIR)) return [];
+    const templates = [];
+    for (const entry of fs.readdirSync(TEMPLATES_DIR, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      if (!entry.name.startsWith('workspace-')) continue;
+      const type = entry.name.replace(/^workspace-/, '');
+      const dir = path.join(TEMPLATES_DIR, entry.name);
+      const metaPath = path.join(dir, 'template.json');
+      const meta = readJson(metaPath) || {};
+      templates.push({
+        type,
+        name: meta.name || type,
+        description: meta.description || '',
+        // Image is served via /api/hub/templates/:type/preview when present.
+        hasImage: meta.image ? fs.existsSync(path.join(dir, meta.image)) : false,
+      });
+    }
+    return templates;
+  }
+
+  router.get('/templates', (req, res) => {
+    res.json({ templates: discoverTemplates() });
+  });
+
+  router.get('/templates/:type/preview', (req, res) => {
+    const type = req.params.type;
+    const dir = path.join(TEMPLATES_DIR, `workspace-${type}`);
+    const metaPath = path.join(dir, 'template.json');
+    const meta = readJson(metaPath);
+    if (!meta?.image) return res.status(404).end();
+    const imgPath = path.join(dir, meta.image);
+    // Defense against path traversal — keep the resolved path inside the
+    // template's own directory.
+    if (!path.resolve(imgPath).startsWith(path.resolve(dir))) {
+      return res.status(403).end();
+    }
+    if (!fs.existsSync(imgPath)) return res.status(404).end();
+    res.sendFile(imgPath);
+  });
+
+  /**
+   * Recursively copy a template directory into a target workspace path.
+   * Skips template-only artifacts (template.json display metadata stays
+   * out of the workspace; template.config.json IS copied so the agent
+   * can drive the variable walkthrough).
+   */
+  function copyTemplateInto(templateType, targetDir) {
+    const src = path.join(TEMPLATES_DIR, `workspace-${templateType}`);
+    if (!fs.existsSync(src)) {
+      throw new Error(`Template "${templateType}" not found`);
+    }
+    fs.cpSync(src, targetDir, {
+      recursive: true,
+      filter: (s) => {
+        const base = path.basename(s);
+        // template.json is gallery-only metadata; preview.png is the
+        // gallery thumbnail. Neither belongs in the created workspace.
+        if (base === 'template.json') return false;
+        if (base === 'preview.png') return false;
+        return true;
+      },
+    });
+  }
+
+  /**
+   * After a template copy, auto-fill the workspace-name-derived variables.
+   *
+   * Templates can declare `auto_fill_from_workspace_name` in their
+   * `data/template.config.json` — an array of variable KEYs that should be
+   * replaced with the operator's workspace name at creation time. This
+   * spares the agent's walkthrough from asking about names the operator
+   * already typed in the Create form.
+   *
+   * Mechanical string replacement, run only on the files declared in
+   * `files_to_substitute`. After substitution, the auto-filled keys are
+   * removed from the config's `variables` array so the agent's
+   * walkthrough skips them, and the `auto_fill_from_workspace_name` field
+   * is dropped (job done — no more auto-fill on subsequent reads).
+   */
+  function autoFillWorkspaceNameVars(workspaceDir, workspaceName) {
+    const cfgPath = path.join(workspaceDir, 'data', 'template.config.json');
+    if (!fs.existsSync(cfgPath)) return;
+    const cfg = readJson(cfgPath);
+    if (!cfg || !Array.isArray(cfg.auto_fill_from_workspace_name) || cfg.auto_fill_from_workspace_name.length === 0) return;
+    if (!Array.isArray(cfg.files_to_substitute)) return;
+
+    const autoKeys = cfg.auto_fill_from_workspace_name;
+
+    // Substitute each {{KEY}} → workspaceName across every file_to_substitute.
+    for (const rel of cfg.files_to_substitute) {
+      const safeRel = String(rel).replace(/\.\./g, '').replace(/^[\/\\]+/, '');
+      const fp = path.resolve(workspaceDir, safeRel);
+      if (!fp.startsWith(path.resolve(workspaceDir))) continue;
+      if (!fs.existsSync(fp)) continue;
+      let content = fs.readFileSync(fp, 'utf-8');
+      let changed = false;
+      for (const key of autoKeys) {
+        const token = `{{${key}}}`;
+        if (content.includes(token)) {
+          content = content.split(token).join(workspaceName);
+          changed = true;
+        }
+      }
+      if (changed) fs.writeFileSync(fp, content, 'utf-8');
+    }
+
+    // Drop the auto-filled keys from variables[] so the walkthrough skips them.
+    if (Array.isArray(cfg.variables)) {
+      cfg.variables = cfg.variables.filter(v => !autoKeys.includes(v.key));
+    }
+    delete cfg.auto_fill_from_workspace_name;
+    writeJson(cfgPath, cfg);
+  }
+
   router.post('/workspaces', avatarUpload.single('photo'), (req, res) => {
-    const { name, description } = req.body;
+    const { name, description, template } = req.body;
     if (!name) return res.status(400).json({ error: 'name is required' });
 
     // Sanitize directory name
@@ -276,6 +410,48 @@ export function hubRouter(hubDir) {
     if (fs.existsSync(target)) {
       return res.status(400).json({ error: `Directory "${dirName}" already exists` });
     }
+
+    // Branch on template: when a template is provided, copy its directory
+    // tree (excluding gallery-only artifacts) into the target. The agent
+    // walks the owner through the {{VARS}} on first admin chat. When no
+    // template is provided ("Blank"), fall back to the inline scaffold
+    // (the existing behavior, kept verbatim below).
+    if (template && String(template).trim()) {
+      try {
+        copyTemplateInto(String(template).trim(), target);
+      } catch (err) {
+        return res.status(400).json({ error: err.message });
+      }
+      // Always ensure required dirs exist even if the template skipped them
+      // (e.g. an older template missing sessions/connections).
+      for (const dir of ['.aaas/connections', '.aaas/sessions', 'transactions/active', 'transactions/archive']) {
+        fs.mkdirSync(path.join(target, dir), { recursive: true });
+      }
+      // Auto-fill workspace-name-derived variables. When the template's
+      // data/template.config.json declares `auto_fill_from_workspace_name`,
+      // substitute those {{KEY}}s with the form's name across every file
+      // in `files_to_substitute`, then remove them from `variables` so the
+      // agent walkthrough skips them. Deterministic, server-side — same
+      // mechanical replacement as apply_template_variables.
+      try { autoFillWorkspaceNameVars(target, name); } catch (err) {
+        console.warn('[hub] auto-fill failed:', err.message);
+      }
+      // Save uploaded photo
+      if (req.file) {
+        const ext = req.file.originalname.split('.').pop() || 'png';
+        const avatarPath = path.join(target, '.aaas', `avatar.${ext}`);
+        fs.writeFileSync(avatarPath, req.file.buffer);
+      }
+      // Copy hub config so the new workspace inherits LLM provider/model
+      const srcConfig = readJson(path.join(hubDir, '.aaas', 'config.json'));
+      if (srcConfig) {
+        writeJson(path.join(target, '.aaas', 'config.json'), srcConfig);
+      }
+      registerWorkspace(target, name);
+      return res.json({ ok: true, directory: dirName, path: target, template: String(template).trim() });
+    }
+
+    // ── No template: inline generic scaffold (existing behavior) ──
 
     // Create workspace structure (mirrors init.js)
     const dirs = [

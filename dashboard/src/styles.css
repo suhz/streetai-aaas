@@ -182,6 +182,13 @@ a:hover { color: var(--text); }
   text-transform: uppercase;
   font-weight: 500;
   padding-left: 44px;
+  padding-right: 4px;
+  /* Long workspace names should wrap to a second line rather than overflow
+     past the sidebar. `anywhere` allows breaking inside a single long word. */
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  line-height: 1.35;
 }
 
 .sidebar-section {
@@ -1479,6 +1486,46 @@ select.input {
 .chat-file-size {
   color: var(--text-muted);
   font-size: 10px;
+}
+
+/* Transaction conversation bubbles — distinct backgrounds for customer,
+   agent, and admin (staff) in both light and dark modes. The muted tokens
+   render too subtle in light mode, so we layer explicit colors per theme. */
+.conv-bubble {
+  padding: 10px 14px;
+  border-radius: 14px;
+  border: 1px solid transparent;
+  font-size: 13.5px;
+  line-height: 1.55;
+  max-width: 85%;
+  word-break: break-word;
+}
+.conv-bubble-customer {
+  background: var(--bg-card-hover);
+  border-color: var(--border);
+  border-bottom-left-radius: 4px;
+}
+.conv-bubble-agent {
+  background: var(--blue-muted);
+  border-color: var(--blue-muted);
+  border-bottom-left-radius: 4px;
+}
+.conv-bubble-admin {
+  background: var(--yellow-muted);
+  border-color: var(--yellow-muted);
+  border-bottom-right-radius: 4px;
+}
+:root[data-theme="light"] .conv-bubble-customer {
+  background: #eef0f4;
+  border-color: #dde0e6;
+}
+:root[data-theme="light"] .conv-bubble-agent {
+  background: #e3edfa;
+  border-color: #c8dcf2;
+}
+:root[data-theme="light"] .conv-bubble-admin {
+  background: #fdf3d8;
+  border-color: #f3e3b4;
 }
 
 @keyframes spin-anim {

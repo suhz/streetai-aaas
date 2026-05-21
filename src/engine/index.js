@@ -247,6 +247,27 @@ export class AgentEngine {
       content: content,
     });
 
+    // 2a. Pause check — if the admin has taken over this session via the
+    // dashboard, the agent stays silent. The customer's message is still
+    // recorded above (so the admin can see it in the conversation panel),
+    // but we skip the LLM / tool loop entirely and return an empty
+    // response so the connector doesn't auto-reply.
+    //
+    // Auto-resume safety net: a paused session whose `paused_at` is older
+    // than PAUSE_MAX_HOURS is treated as unpaused (clears the flag and
+    // proceeds normally). This protects against an admin forgetting to
+    // resume the agent for days.
+    //
+    // The pause flag is NOT honored for events that came from the
+    // dashboard itself (those are admin actions, not customer messages),
+    // but right now nothing in this codepath sets metadata.from_dashboard
+    // — direct admin messages bypass processEvent entirely and go straight
+    // to the platform's API.
+    const isPaused = this._isSessionPaused(platform, userId);
+    if (isPaused) {
+      return { response: '', toolsUsed: [], tokensUsed: 0, paused: true };
+    }
+
     // 2b. Resolve mode early — needed for memory scope and tool execution.
     // Use session-stored mode if available (set by /admin or /customer commands).
     // metadata.force_admin_mode wins regardless — used by processOwnerReply
@@ -341,7 +362,7 @@ export class AgentEngine {
     } catch (e) { /* debug logging should never break chat */ }
 
     // 7. Call LLM with tool loop
-    const ADMIN_ONLY_TOOLS = ['read_skill', 'write_skill', 'read_soul', 'write_soul', 'read_data_file', 'write_data_file', 'read_extensions', 'add_extension', 'remove_extension'];
+    const ADMIN_ONLY_TOOLS = ['read_skill', 'write_skill', 'apply_template_variables', 'read_soul', 'write_soul', 'read_data_file', 'write_data_file', 'rename_data_file', 'read_extensions', 'add_extension', 'remove_extension'];
     let tools = this.toolRegistry.getToolDefinitions();
     if (mode !== 'admin') {
       tools = tools.filter(t => !ADMIN_ONLY_TOOLS.includes(t.name));
@@ -548,6 +569,33 @@ export class AgentEngine {
       factsCount: this.memoryManager?.getAllFacts().length || 0,
       toolsAvailable: this.toolRegistry?.getToolDefinitions().length || 0,
     };
+  }
+
+  /**
+   * Check whether the agent has been paused on this session by an admin
+   * via the dashboard. Reads the `paused` / `paused_at` flags from session
+   * meta. Auto-clears (returns false) if the pause is older than the max
+   * duration — a safety net for admins who forget to resume.
+   *
+   * Max pause duration default: 24h. Override via config.pauseMaxHours.
+   */
+  _isSessionPaused(platform, userId) {
+    const paused = this.sessionManager.getSessionMeta(platform, userId, 'paused');
+    if (!paused) return false;
+
+    const pausedAt = this.sessionManager.getSessionMeta(platform, userId, 'paused_at');
+    const maxHours = this.config.pauseMaxHours || 24;
+    if (pausedAt) {
+      const ageMs = Date.now() - new Date(pausedAt).getTime();
+      if (Number.isFinite(ageMs) && ageMs > maxHours * 60 * 60 * 1000) {
+        // Stale pause — auto-resume.
+        this.sessionManager.setSessionMeta(platform, userId, 'paused', null);
+        this.sessionManager.setSessionMeta(platform, userId, 'paused_at', null);
+        console.log(`[engine] Auto-resumed session ${platform}:${userId} (paused > ${maxHours}h)`);
+        return false;
+      }
+    }
+    return true;
   }
 
   /**

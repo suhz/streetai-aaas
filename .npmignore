@@ -9,6 +9,8 @@ image_geenrator/
 kings_melody/
 .claude/
 calicut_paragon_restaurant_llc/
+local-aaas/
+kpub/
 
 # Dev files
 dashboard/src/

@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useContext } from 'react';
 import { useSearchParams } from 'react-router-dom';
+import { marked } from 'marked';
 import { useFetch, useResolveUrl, useApi, WorkspaceContext } from '../hooks/useApi.js';
 import { getTableColumns, getLabel, formatCellWithConfig, formatCurrency, prettyKey } from '../utils/transactionView.js';
 import { setLastSeen, getLastSeen } from '../utils/unseenTransactions.js';
@@ -907,6 +908,11 @@ function TransactionDetail({ id, onBack, currency: fallbackCurrency, viewConfig,
           </div>
         </div>
       )}
+
+      {/* Conversation thread — placed at the end so staff scrolls past the
+          structured transaction data first, then sees/manages the live
+          customer↔agent thread. Read-only history + staff message input. */}
+      <ConversationCard transactionId={id} />
     </div>
   );
 }
@@ -1185,5 +1191,529 @@ function AutoDetail({ data, viewConfig, currency }) {
       <FieldGroup title="Delivery" data={data.delivery} viewConfig={viewConfig} currency={currency} />
       <FieldGroup title="Payment" data={data.payment} viewConfig={viewConfig} currency={currency} />
     </>
+  );
+}
+
+/**
+ * Conversation thread for a transaction.
+ *
+ * Renders the customer↔agent session that produced this transaction and
+ * lets staff send instructions to the agent (which the agent acts on —
+ * messaging the customer, updating the row, looking something up).
+ *
+ * Polling: every 5s while the tab is visible. Stops when hidden.
+ * Source of truth: the customer's session file on disk; this card is just
+ * a viewer + injector. Nothing is duplicated in the dashboard's storage.
+ *
+ * Staff messages are detected by their `[ADMIN MESSAGE FROM DASHBOARD` or
+ * `[ADMIN GUIDANCE` content prefix — both shapes already used by the
+ * existing owner-reply path (Telegram/WhatsApp). The header is stripped
+ * for display so staff sees the actual message text.
+ */
+function ConversationCard({ transactionId }) {
+  const api = useApi();
+  const [data, setData] = useState(null);
+  const [error, setError] = useState(null);
+  const [draft, setDraft] = useState('');
+  const [sending, setSending] = useState(false);
+  const [sendError, setSendError] = useState(null);
+  const [pauseBusy, setPauseBusy] = useState(false);
+  const [pauseError, setPauseError] = useState(null);
+  const scrollRef = useRef(null);
+
+  const refresh = async () => {
+    try {
+      const r = await api.get(`/api/transactions/${encodeURIComponent(transactionId)}/conversation`);
+      setData(r);
+      setError(null);
+    } catch (e) {
+      setError(e.message || 'Failed to load conversation');
+    }
+  };
+
+  useEffect(() => {
+    refresh();
+    // Re-fetch every 5s while the tab is visible. Pauses when hidden so we
+    // don't hammer the server when the user is on another tab.
+    const id = setInterval(() => {
+      if (!document.hidden) refresh();
+    }, 5000);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [transactionId]);
+
+  // Auto-scroll to newest message when message count grows.
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [data?.messages?.length]);
+
+  const paused = !!data?.paused;
+
+  const togglePause = async () => {
+    if (pauseBusy) return;
+    setPauseBusy(true);
+    setPauseError(null);
+    const path = paused ? 'unpause' : 'pause';
+    try {
+      await api.post(`/api/transactions/${encodeURIComponent(transactionId)}/${path}`, {});
+      await refresh();
+    } catch (e) {
+      setPauseError(e.message || `Failed to ${path}`);
+    } finally {
+      setPauseBusy(false);
+    }
+  };
+
+  const send = async () => {
+    const text = draft.trim();
+    if (!text || sending) return;
+    setSending(true);
+    setSendError(null);
+    try {
+      await api.post(`/api/transactions/${encodeURIComponent(transactionId)}/admin-message`, { message: text });
+      setDraft('');
+      await refresh();
+    } catch (e) {
+      setSendError(e.message || 'Failed to send');
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const onKeyDown = (e) => {
+    // Cmd/Ctrl+Enter sends. Plain Enter inserts a newline so multi-line
+    // messages are easy to type.
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+      e.preventDefault();
+      send();
+    }
+  };
+
+  const messages = data?.messages || [];
+  const customerLabel = data?.customer?.user_name || data?.customer?.user_id || 'Customer';
+  const inputDisabled = !paused || sending;
+
+  return (
+    <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
+      <div
+        style={{
+          padding: '14px 18px',
+          borderBottom: '1px solid var(--border-subtle)',
+          display: 'flex',
+          alignItems: 'center',
+          gap: 10,
+          background: 'var(--bg-surface)',
+          flexWrap: 'wrap',
+        }}
+      >
+        <span style={{ fontWeight: 600, fontSize: 14, color: 'var(--text)' }}>Conversation</span>
+        {data?.customer?.platform && (
+          <span
+            style={{
+              fontSize: 11,
+              padding: '2px 8px',
+              borderRadius: 999,
+              background: 'var(--accent-muted)',
+              color: 'var(--text-secondary)',
+              textTransform: 'capitalize',
+            }}
+          >
+            {data.customer.platform}
+          </span>
+        )}
+        {paused && (
+          <span
+            style={{
+              fontSize: 11,
+              padding: '2px 8px',
+              borderRadius: 999,
+              background: 'var(--yellow-muted)',
+              color: 'var(--yellow)',
+              fontWeight: 600,
+              letterSpacing: 0.3,
+              textTransform: 'uppercase',
+            }}
+            title={data?.paused_at ? `Paused at ${formatDate(data.paused_at)}` : ''}
+          >
+            Agent paused
+          </span>
+        )}
+        <span style={{ fontSize: 12, color: 'var(--text-muted)', marginLeft: 'auto' }}>
+          {messages.length > 0
+            ? `${messages.length} message${messages.length === 1 ? '' : 's'} with ${customerLabel}`
+            : 'No messages yet'}
+        </span>
+      </div>
+
+      {pauseError && (
+        <div style={{ padding: '8px 18px', fontSize: 12, color: 'var(--red)', background: 'var(--red-muted)' }}>
+          {pauseError}
+        </div>
+      )}
+
+      {error && (
+        <div
+          style={{
+            padding: '10px 18px',
+            fontSize: 13,
+            color: 'var(--red)',
+            background: 'var(--red-muted)',
+            borderBottom: '1px solid var(--border-subtle)',
+          }}
+        >
+          {error}
+        </div>
+      )}
+
+      <div
+        ref={scrollRef}
+        style={{
+          maxHeight: 440,
+          minHeight: 120,
+          overflowY: 'auto',
+          padding: '16px 18px',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 10,
+          background: 'var(--bg-main)',
+        }}
+      >
+        {messages.length === 0 && !error && (
+          <div
+            style={{
+              padding: '24px 0',
+              fontSize: 13,
+              color: 'var(--text-muted)',
+              textAlign: 'center',
+            }}
+          >
+            No conversation yet.
+          </div>
+        )}
+        {messages.map((m, i) => (
+          <MessageBubble key={i} message={m} />
+        ))}
+      </div>
+
+      <div
+        style={{
+          padding: '12px 18px 16px',
+          borderTop: '1px solid var(--border-subtle)',
+          background: 'var(--bg-surface)',
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'flex-end', gap: 10 }}>
+          <textarea
+            className="input"
+            value={draft}
+            onChange={e => setDraft(e.target.value)}
+            onKeyDown={onKeyDown}
+            placeholder={paused
+              ? 'Message the customer directly… (Ctrl/Cmd+Enter to send)'
+              : 'Pause the agent to talk to the customer.'}
+            rows={2}
+            disabled={inputDisabled}
+            style={{
+              flex: 1,
+              maxWidth: 520,
+              resize: 'none',
+              fontFamily: 'inherit',
+              fontSize: 13,
+              lineHeight: 1.5,
+              boxSizing: 'border-box',
+              opacity: paused ? 1 : 0.6,
+            }}
+          />
+          <button
+            className="btn btn-primary"
+            onClick={send}
+            disabled={inputDisabled || !draft.trim()}
+            style={{
+              minWidth: 140,
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: 8,
+              fontWeight: 600,
+              fontSize: 13,
+              padding: '10px 16px',
+              borderRadius: 8,
+              cursor: (inputDisabled || !draft.trim()) ? 'not-allowed' : 'pointer',
+              transition: 'transform 0.06s ease, opacity 0.2s ease, filter 0.2s ease',
+              flexShrink: 0,
+              // Explicit enabled/disabled visuals so pausing/resuming the
+              // agent reads as a state change on this button too.
+              opacity: (inputDisabled || !draft.trim()) ? 0.45 : 1,
+              filter: !paused ? 'grayscale(0.6)' : 'none',
+            }}
+            onMouseDown={e => { if (!e.currentTarget.disabled) e.currentTarget.style.transform = 'translateY(1px)'; }}
+            onMouseUp={e => { e.currentTarget.style.transform = ''; }}
+            onMouseLeave={e => { e.currentTarget.style.transform = ''; }}
+          >
+            {sending ? (
+              <>
+                <span
+                  style={{
+                    width: 12,
+                    height: 12,
+                    border: '2px solid currentColor',
+                    borderTopColor: 'transparent',
+                    borderRadius: '50%',
+                    display: 'inline-block',
+                    animation: 'spin 0.8s linear infinite',
+                  }}
+                />
+                Sending
+              </>
+            ) : (
+              'Send to customer'
+            )}
+          </button>
+          <button
+            onClick={togglePause}
+            disabled={pauseBusy}
+            title={paused
+              ? 'Resume the agent. It will pick up the conversation with full history.'
+              : 'Pause the agent so you can talk to the customer directly.'}
+            style={{
+              minWidth: 130,
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: 6,
+              fontWeight: 600,
+              fontSize: 13,
+              padding: '10px 16px',
+              borderRadius: 8,
+              cursor: pauseBusy ? 'wait' : 'pointer',
+              flexShrink: 0,
+              // Stateful color: paused → green (action: resume), not paused → yellow (action: pause)
+              background: paused ? 'var(--green-muted)' : 'var(--yellow-muted)',
+              color: paused ? 'var(--green)' : 'var(--yellow)',
+              border: `1px solid ${paused ? 'var(--green)' : 'var(--yellow)'}`,
+              transition: 'background 0.15s ease, filter 0.15s ease',
+            }}
+            onMouseEnter={e => { if (!e.currentTarget.disabled) e.currentTarget.style.filter = 'brightness(1.08)'; }}
+            onMouseLeave={e => { e.currentTarget.style.filter = ''; }}
+          >
+            <span
+              aria-hidden
+              style={{
+                width: 8,
+                height: 8,
+                borderRadius: '50%',
+                background: paused ? 'var(--green)' : 'var(--yellow)',
+                display: 'inline-block',
+              }}
+            />
+            {pauseBusy ? '…' : paused ? 'Resume agent' : 'Pause agent'}
+          </button>
+        </div>
+        {!paused && !sendError && (
+          <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 8 }}>
+            Pause the agent to message the customer.
+          </div>
+        )}
+        {sendError && (
+          <div style={{ fontSize: 11, color: 'var(--red)', marginTop: 8 }}>
+            {sendError}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
+/**
+ * Render a single message bubble. Three visual variants:
+ *   - Staff (admin-injected from dashboard or owner reply via Telegram/WA)
+ *     → right-aligned amber bubble, header stripped from display
+ *   - Customer (any other user-role message)
+ *     → left-aligned gray bubble
+ *   - Agent (assistant-role)
+ *     → left-aligned themed bubble
+ */
+function MessageBubble({ message }) {
+  const isAssistant = message.role === 'assistant';
+  const content = typeof message.content === 'string' ? message.content : JSON.stringify(message.content);
+
+  // Detect admin-injected user messages by their header. Two formats:
+  //   - New direct-intervention: `[ADMIN MESSAGE FROM DASHBOARD] <body>`
+  //     (single-line, no quote markers — what the pause/intervention flow
+  //     saves today)
+  //   - Legacy owner-reply via Telegram/WhatsApp: `[ADMIN GUIDANCE ...]`
+  //     header followed by a `> <body>` quote block (still in some old
+  //     sessions)
+  // The bubble color + role label already say "Admin" — we strip the
+  // header text from the body so the bubble just shows the actual message.
+  const isStaffMessage = !isAssistant && (
+    content.startsWith('[ADMIN MESSAGE FROM DASHBOARD') ||
+    content.startsWith('[ADMIN GUIDANCE')
+  );
+
+  let displayText = content;
+  if (isStaffMessage) {
+    // Newer single-line format: strip the bracketed prefix exactly.
+    const directPrefix = /^\[ADMIN MESSAGE FROM DASHBOARD\]\s*/;
+    if (directPrefix.test(content)) {
+      displayText = content.replace(directPrefix, '').trim();
+    } else {
+      // Legacy quoted-body format: pull out the `> ...` lines.
+      const quoteIdx = content.indexOf('\n> ');
+      if (quoteIdx !== -1) {
+        displayText = content
+          .slice(quoteIdx + 1)
+          .split('\n')
+          .map(l => l.startsWith('> ') ? l.slice(2) : l)
+          .join('\n')
+          .trim();
+      }
+    }
+  }
+
+  // Pick role + visual style. Bubble styling lives in styles.css
+  // (.conv-bubble-customer / -agent / -admin) so light + dark each have
+  // explicit, distinct backgrounds — the muted tokens alone aren't
+  // pronounced enough in light mode.
+  let role, bubbleClass, accent, align;
+  if (isAssistant) {
+    role = 'Agent';
+    bubbleClass = 'conv-bubble-agent';
+    accent = 'var(--blue)';
+    align = 'flex-start';
+  } else if (isStaffMessage) {
+    role = 'Admin';
+    bubbleClass = 'conv-bubble-admin';
+    accent = 'var(--yellow)';
+    align = 'flex-end';
+  } else {
+    role = 'Customer';
+    bubbleClass = 'conv-bubble-customer';
+    accent = 'var(--text-secondary)';
+    align = 'flex-start';
+  }
+
+  const ts = message.timestamp || message.at;
+
+  // Extract Truuze/connector-style attached-file markers so we can render
+  // images/file pills instead of leaking the raw "[Attached files: ...]"
+  // line into the bubble. Format produced by the truuze connector:
+  //   "[Attached files: image: data/inbox/foo.jpg, audio: data/inbox/bar.m4a]"
+  const { cleanText, files } = extractAttachedFiles(displayText);
+
+  // Markdown rendering matches the main Chat page so agent responses with
+  // lists / bold / code render properly. `breaks: true` preserves soft
+  // line breaks the way the rest of the dashboard does.
+  const renderedHtml = cleanText ? marked.parse(cleanText, { breaks: true }) : '';
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', alignItems: align, maxWidth: '100%', marginTop: 2 }}>
+      <div
+        style={{
+          fontSize: 10,
+          color: accent,
+          marginBottom: 4,
+          padding: '0 4px',
+          fontWeight: 600,
+          letterSpacing: 0.4,
+          textTransform: 'uppercase',
+        }}
+      >
+        {role}
+        {ts && (
+          <span style={{ marginLeft: 8, color: 'var(--text-muted)', fontWeight: 400, textTransform: 'none', letterSpacing: 0 }}>
+            {formatDate(ts)}
+          </span>
+        )}
+      </div>
+      <div className={`conv-bubble ${bubbleClass} chat-markdown`} style={{ color: 'var(--text)' }}>
+        {renderedHtml ? (
+          <div dangerouslySetInnerHTML={{ __html: renderedHtml }} />
+        ) : (
+          !files.length && <span style={{ opacity: 0.5 }}>(empty)</span>
+        )}
+        {files.length > 0 && <AttachedFiles files={files} />}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Pull `[Attached files: type: path, ...]` blocks out of a message string.
+ * Returns the cleaned text (with all markers removed and surrounding blank
+ * lines collapsed) plus a list of `{ type, path }` entries.
+ *
+ * The marker format is emitted by the truuze connector when downloading
+ * inbound media into `data/inbox/`. Other connectors may surface files
+ * differently — those go through markdown rendering as-is.
+ */
+function extractAttachedFiles(text) {
+  if (!text) return { cleanText: '', files: [] };
+  const markerRe = /\[Attached files:\s*([^\]]+)\]/g;
+  const files = [];
+  let m;
+  while ((m = markerRe.exec(text)) !== null) {
+    for (const part of m[1].split(',')) {
+      const [type, ...rest] = part.split(':');
+      const filePath = rest.join(':').trim();
+      if (filePath) files.push({ type: (type || 'file').trim(), path: filePath });
+    }
+  }
+  const cleanText = text.replace(markerRe, '').replace(/\n{3,}/g, '\n\n').trim();
+  return { cleanText, files };
+}
+
+/**
+ * Render attached files inside a bubble. Reuses the .chat-file-image and
+ * .chat-file-badge CSS classes from the Chat page so images and document
+ * pills look identical to those in /chat.
+ */
+function AttachedFiles({ files }) {
+  const resolveUrl = useResolveUrl();
+  const urlFor = (p) => resolveUrl(`/api/workspace/${p}`);
+  const isImage = (f) => f.type === 'image' || /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(f.path);
+  const isAudio = (f) => f.type === 'audio' || /\.(mp3|wav|m4a|ogg|flac)$/i.test(f.path);
+  const isVideo = (f) => f.type === 'video' || /\.(mp4|webm|mov|avi)$/i.test(f.path);
+
+  return (
+    <div className="chat-msg-files" style={{ marginTop: 8 }}>
+      {files.map((f, i) => {
+        const url = urlFor(f.path);
+        const name = f.path.split('/').pop();
+        if (isImage(f)) {
+          return (
+            <a key={i} className="chat-file-image" href={url} target="_blank" rel="noopener noreferrer">
+              <img src={url} alt={name} />
+            </a>
+          );
+        }
+        if (isAudio(f)) {
+          return (
+            <div key={i} style={{ minWidth: 220, padding: 8, border: '1px solid var(--border)', borderRadius: 8, background: 'var(--bg-input)' }}>
+              <div style={{ fontSize: 11, marginBottom: 4, color: 'var(--text-secondary)', wordBreak: 'break-all' }}>{name}</div>
+              <audio controls src={url} style={{ width: '100%' }} />
+            </div>
+          );
+        }
+        if (isVideo(f)) {
+          return (
+            <a key={i} className="chat-file-image" href={url} target="_blank" rel="noopener noreferrer">
+              <video src={url} style={{ width: '100%', maxHeight: 240, objectFit: 'cover', display: 'block' }} />
+            </a>
+          );
+        }
+        return (
+          <a key={i} className="chat-file-badge" href={url} target="_blank" rel="noopener noreferrer" title={name}>
+            <svg width="12" height="12" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M17 10.5V7.5a5.5 5.5 0 00-11 0v6a3.5 3.5 0 007 0V7a1.5 1.5 0 00-3 0v7" />
+            </svg>
+            {name}
+          </a>
+        );
+      })}
+    </div>
   );
 }

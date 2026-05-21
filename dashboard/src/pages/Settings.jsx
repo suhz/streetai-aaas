@@ -2,6 +2,7 @@ import React, { useState, useEffect, useContext } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useApi, WorkspaceContext } from '../hooks/useApi.js';
 import { ThemeContext } from '../hooks/useTheme.js';
+import { useNavMode } from '../hooks/useNavMode.js';
 
 const PROVIDERS = [
   { value: 'anthropic', label: 'Anthropic (Claude)', hasOAuth: true },
@@ -20,6 +21,11 @@ export default function Settings() {
   const themeCtx = useContext(ThemeContext);
   const theme = themeCtx?.theme || 'dark';
   const setTheme = themeCtx?.setTheme || (() => {});
+  // Nav mode is per-workspace. In hub mode this hook reads/writes the
+  // current workspace's setting via WorkspaceContext; in standalone the
+  // workspace context is undefined so it falls back to the synthetic
+  // standalone key.
+  const { navMode, setNavMode } = useNavMode(workspace);
   const [config, setConfig] = useState(null);
   const [engineStatus, setEngineStatus] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -529,6 +535,51 @@ export default function Settings() {
             <p className="form-hint">Choose your preferred dashboard appearance. Your preference is saved locally.</p>
           </div>
         </div>
+
+        {/* Navigation — per-workspace setting, hidden at hub root since
+            the hub sidebar uses its own nav config (not workspaceNav). */}
+        {workspace && (
+        <div className="card">
+          <div className="card-header">Navigation</div>
+          <div className="card-body">
+            <div className="form-group">
+              <label>Sidebar layout</label>
+              <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
+                <button
+                  className={`btn ${navMode === 'admin' ? 'btn-primary' : ''}`}
+                  onClick={() => setNavMode('admin')}
+                  style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+                >
+                  <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                    <rect x="1.5" y="2" width="11" height="2" rx="0.5" />
+                    <rect x="1.5" y="6" width="11" height="2" rx="0.5" />
+                    <rect x="1.5" y="10" width="11" height="2" rx="0.5" />
+                  </svg>
+                  Admin
+                </button>
+                <button
+                  className={`btn ${navMode === 'basic' ? 'btn-primary' : ''}`}
+                  onClick={() => setNavMode('basic')}
+                  style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+                >
+                  <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                    <circle cx="3" cy="3.5" r="1.2" />
+                    <line x1="6" y1="3.5" x2="12" y2="3.5" />
+                    <circle cx="3" cy="7" r="1.2" />
+                    <line x1="6" y1="7" x2="12" y2="7" />
+                    <circle cx="3" cy="10.5" r="1.2" />
+                    <line x1="6" y1="10.5" x2="12" y2="10.5" />
+                  </svg>
+                  Basic
+                </button>
+              </div>
+            </div>
+            <p className="form-hint">
+              <strong>Admin</strong> shows the full sidebar with all sections. <strong>Basic</strong> hides technical pages (Skill, Soul, Data, Memory, Extensions, Deploy) for day-to-day use — switch back to Admin here when needed.
+            </p>
+          </div>
+        </div>
+        )}
       </div>
 
       {removeKeyConfirm && (

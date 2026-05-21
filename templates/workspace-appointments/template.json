@@ -1,0 +1,6 @@
+{
+  "name": "Appointments",
+  "description": "Service list, bookings, and intake info. Built for clinics, repair shops, tutors, plumbers, photographers, and similar service businesses.",
+  "image": "preview.png",
+  "type": "appointments"
+}

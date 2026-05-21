@@ -1126,7 +1126,36 @@ On Telegram, Discord, WhatsApp, and Slack, the owner can switch modes by typing:
 
 When you type \`/admin\` on a platform for the first time, the agent will ask you to verify your identity. A 6-character code will appear on the **Deploy** page in the dashboard. Type that code in the platform chat to confirm you are the owner. This only needs to be done once per platform. After verification, \`/admin\` and \`/customer\` work instantly.
 
-Only the verified owner can switch modes. Other users who try \`/admin\` will be denied.`,
+Only the verified owner can switch modes. Other users who try \`/admin\` will be denied.
+
+### Pausing the Agent and Talking to a Customer Directly
+
+Sometimes you need to step in and message a customer yourself: confirm an out-of-stock substitution, sort out a delivery issue, or handle a request the agent should not answer alone. The transaction detail page has a Conversation panel that lets you do this.
+
+How it works:
+
+1. Open the transaction in **Transactions**. Scroll to the **Conversation** panel at the bottom of the detail page.
+2. Click **Pause agent**. The agent stops processing this customer's incoming messages. Their messages are still recorded in the conversation history.
+3. Type in the message box and click **Send to customer**. The message is delivered to the customer on whichever platform they are using (currently supported: Telegram). It appears in the conversation panel as an Admin bubble.
+4. Customer replies arrive as Customer bubbles. The agent does not respond while paused.
+5. Click **Resume agent** when you are done. The agent picks up the next customer turn with the full intervention visible to it as context.
+
+Safety nets:
+
+- The Send button is disabled until you pause. The pause action is the explicit "I'm taking over" gate.
+- A paused session auto-resumes after 24 hours if you forget.
+- All paused sessions auto-resume when a connector restarts. Pause state does not survive a daemon restart.
+
+### Switching Sidebar Layout (Admin / Basic)
+
+Each workspace has its own sidebar layout, set in **Settings &rarr; Navigation**:
+
+- **Admin** (default) — full sidebar with Monitor, Configure, Storage, and Runtime sections. Use this when building or maintaining the workspace.
+- **Basic** — a flat sidebar showing only Overview, Transactions, Chat, Notifications, Payments, and Settings. Use this when handing the workspace to a non-technical operator (for example, restaurant front-of-house staff).
+
+The setting is per workspace, stored in your browser. Switching one workspace to Basic does not affect any other workspace in the hub. You can flip back to Admin at any time from the same Settings page.
+
+Basic hides Skill, Soul, Data, Memory, Extensions, Deploy, and the Setup Guide. Routes still resolve if you type the URL directly, but the menu items are not shown.`,
   },
   {
     id: 'settings',

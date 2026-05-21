@@ -44,6 +44,122 @@ export function writeSoul(paths, { content }) {
 }
 
 /**
+ * Apply variable substitutions to a list of workspace files. Used during
+ * first-time setup of templated workspaces (e.g. the restaurant template).
+ *
+ * Reads `data/template.config.json` for the `files_to_substitute` list,
+ * then runs a mechanical `{{KEY}}` → value replacement across each file.
+ * No LLM-driven rewriting — the substitution preserves frontmatter,
+ * section order, whitespace, and every other structural detail exactly.
+ *
+ * Args:
+ *   - values:        { [KEY]: string } — the answers collected from the owner
+ *   - files:         optional override of the files list (defaults to the
+ *                    files_to_substitute array in template.config.json)
+ *
+ * Returns a JSON string with:
+ *   - ok:             boolean
+ *   - files_updated:  [{ file, substitutions }]
+ *   - remaining:      [{ file, placeholders: [...] }] — any `{{KEY}}`
+ *                     tokens that didn't get substituted (caller should
+ *                     surface these so the owner knows what's missing)
+ *
+ * Admin-only — registered in the admin tool list.
+ */
+export function applyTemplateVariables(paths, { values, files }) {
+  if (!values || typeof values !== 'object') {
+    return JSON.stringify({ error: 'values is required (object mapping KEY → value).' });
+  }
+
+  let fileList = files;
+  if (!Array.isArray(fileList)) {
+    const cfgPath = path.join(paths.data, 'template.config.json');
+    if (!fs.existsSync(cfgPath)) {
+      return JSON.stringify({ error: 'No files list provided and data/template.config.json not found.' });
+    }
+    const cfg = readJson(cfgPath);
+    fileList = cfg?.files_to_substitute;
+    if (!Array.isArray(fileList)) {
+      return JSON.stringify({ error: 'template.config.json does not contain a files_to_substitute array.' });
+    }
+  }
+
+  const filesUpdated = [];
+  const remaining = [];
+
+  for (const relPath of fileList) {
+    // Resolve workspace-root-relative path. Block path traversal.
+    const safeRel = String(relPath).replace(/\.\./g, '').replace(/^[\/\\]+/, '');
+    const fp = path.resolve(paths.root, safeRel);
+    if (!fp.startsWith(path.resolve(paths.root))) {
+      remaining.push({ file: relPath, error: 'invalid path' });
+      continue;
+    }
+    if (!fs.existsSync(fp)) {
+      remaining.push({ file: relPath, error: 'file not found' });
+      continue;
+    }
+
+    const original = fs.readFileSync(fp, 'utf-8');
+    let updated = original;
+    let substitutions = 0;
+
+    // All substitutions operate on the ORIGINAL content per file by
+    // accumulating replacements. That stops a value containing a literal
+    // {{KEY}} from being touched by a later substitution.
+    for (const [key, value] of Object.entries(values)) {
+      const token = `{{${key}}}`;
+      // Count occurrences in the current state of `updated`
+      const parts = updated.split(token);
+      if (parts.length > 1) {
+        substitutions += parts.length - 1;
+        updated = parts.join(String(value ?? ''));
+      }
+    }
+
+    if (substitutions > 0) {
+      fs.writeFileSync(fp, updated, 'utf-8');
+    }
+
+    // After substitution, report any leftover {{...}} tokens so the
+    // caller can prompt the owner for the missing values.
+    const leftoverRe = /\{\{([A-Z_][A-Z0-9_]*)\}\}/g;
+    const leftover = new Set();
+    let m;
+    while ((m = leftoverRe.exec(updated)) !== null) leftover.add(m[1]);
+    if (leftover.size > 0) {
+      remaining.push({ file: relPath, placeholders: [...leftover] });
+    }
+
+    filesUpdated.push({ file: relPath, substitutions });
+  }
+
+  return JSON.stringify({ ok: true, files_updated: filesUpdated, remaining });
+}
+
+/**
+ * Rename or move a file inside the data/ directory. Used when a file
+ * landed under a wrong filename (e.g. uploaded with its original
+ * generated name) and needs to match a path referenced elsewhere
+ * (e.g. menu.json category_images). Path-traversal-guarded.
+ */
+export function renameDataFile(paths, { from, to }) {
+  if (!from || !to) return JSON.stringify({ error: 'from and to are required.' });
+  const sanitize = (s) => String(s).replace(/^data[\/\\]/, '').replace(/\.\./g, '');
+  const src = path.resolve(paths.data, sanitize(from));
+  const dst = path.resolve(paths.data, sanitize(to));
+  const dataRoot = path.resolve(paths.data);
+  if (!src.startsWith(dataRoot) || !dst.startsWith(dataRoot)) {
+    return JSON.stringify({ error: 'Invalid path.' });
+  }
+  if (!fs.existsSync(src)) return JSON.stringify({ error: `"${from}" not found in data/.` });
+  if (fs.existsSync(dst)) return JSON.stringify({ error: `"${to}" already exists.` });
+  fs.mkdirSync(path.dirname(dst), { recursive: true });
+  fs.renameSync(src, dst);
+  return JSON.stringify({ ok: true, from: sanitize(from), to: sanitize(to) });
+}
+
+/**
  * Read a data file from the data/ directory.
  */
 export function readDataFile(paths, { file }) {

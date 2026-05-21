@@ -57,6 +57,43 @@ export function parseTransactionFieldsBlock(skillText) {
 }
 
 /**
+ * Parse a `Currency: AED` (or `Currency: AED, USD`) declaration from the
+ * top of the `## Transaction Fields` block. This is workspace-level schema
+ * metadata — it tells the engine which currency units are accepted on
+ * `currency`-typed fields, and which one to use as the default when the
+ * agent omits `currency` on a transaction.
+ *
+ * Returns:
+ *   - `{ default: 'AED', allowed: ['AED'] }` for a single-currency workspace
+ *   - `{ default: 'AED', allowed: ['AED', 'USD'] }` for multi-currency
+ *   - `null` when no declaration is present (including unfilled template
+ *     placeholders like `Currency: [...]`)
+ *
+ * Behavior preserved for legacy workspaces with no declaration: callers
+ * skip currency validation entirely and `createTransaction` falls back to
+ * its hardcoded `$`.
+ */
+export function parseCurrencyDeclaration(skillText) {
+  if (!skillText || typeof skillText !== 'string') return null;
+  const blockRe = /(^|\n)##\s+Transaction\s+Fields\s*\n([\s\S]*?)(?=\n##\s+|\n#\s+|$)/i;
+  const m = skillText.match(blockRe);
+  if (!m) return null;
+  const body = m[2];
+
+  // Allow optional bullet/whitespace, ignore template placeholder lines
+  // like `Currency: [Platform currency name, e.g., "TK"...]`.
+  const lineRe = /^\s*[-*]?\s*Currency\s*:\s*([^\n\[]+?)\s*$/im;
+  const lm = body.match(lineRe);
+  if (!lm) return null;
+  const raw = lm[1].trim();
+  if (!raw) return null;
+
+  const list = raw.split(',').map(s => s.trim()).filter(Boolean);
+  if (list.length === 0) return null;
+  return { default: list[0], allowed: list };
+}
+
+/**
  * Parse the `## Item Fields` block. Same line syntax as Transaction Fields.
  * Used when a transaction field is declared as `object_list` — the agent then
  * captures each item as an object whose shape is defined here.

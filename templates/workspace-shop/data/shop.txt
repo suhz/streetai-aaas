@@ -1,0 +1,6 @@
+Welcome to {{SHOP_SHORT}} — we sell {{WHAT_YOU_SELL}}.
+
+⏰ Customer service: {{HOURS_DAILY}}
+📞 {{PHONE}}
+🚚 {{DELIVERY_OPTIONS}}
+📍 {{REGION}}

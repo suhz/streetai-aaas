@@ -1,0 +1,5 @@
+Welcome to {{BUSINESS_SHORT}} — {{WHAT_YOU_DO}}.
+
+⏰ Open: {{HOURS_DAILY}}
+📞 Bookings: {{PHONE}}
+📍 {{REGION}}

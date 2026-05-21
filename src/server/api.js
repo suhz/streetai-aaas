@@ -12,6 +12,7 @@ import { listConnections, loadConnection, saveConnection, removeConnection } fro
 import { AgentEngine } from '../engine/index.js';
 import { extractFiles } from '../connectors/media.js';
 import { buildPlatformSkill, parseTruuzeSkill } from '../connectors/truuze-skill.js';
+import { sendDirectToCustomer } from '../connectors/index.js';
 import { getConnectorMap } from './connector-registry.js';
 
 
@@ -467,6 +468,176 @@ export function apiRouter(workspace) {
     res.json({ ok: true, transaction: txn });
   });
 
+
+  // ─── Conversation thread on a transaction ────────────────────────
+  //
+  // Pause/intervention model:
+  //   - The admin can pause the agent on a session. While paused, the
+  //     agent does NOT process incoming customer messages (those are still
+  //     recorded in the session so the admin can see them).
+  //   - Only while paused, the admin can send messages from the dashboard.
+  //     These go directly to the customer's chat via the platform's API
+  //     (using each connector's static `sendDirect` export) — the agent
+  //     is bypassed entirely.
+  //   - Resuming the agent puts everything back to normal; the agent sees
+  //     the full intervention in its next turn for context.
+
+  /**
+   * Resolve which session a transaction belongs to. New transactions stamp
+   * `session_platform` at creation; legacy rows without it fall back to a
+   * unique-match scan of `.aaas/sessions/<platform>_<userId>.json`.
+   * Returns null when ambiguous or unknown — caller surfaces a 409 so the
+   * UI can prompt the admin to use chat instead.
+   */
+  function resolveTxnSession(txn) {
+    if (!txn?.user_id) return null;
+    if (txn.session_platform) return { platform: txn.session_platform, userId: txn.user_id };
+
+    const sessionsDir = path.join(workspace, '.aaas', 'sessions');
+    if (!fs.existsSync(sessionsDir)) return null;
+    const suffix = `_${txn.user_id}.json`;
+    const matches = fs.readdirSync(sessionsDir).filter(f => f.endsWith(suffix));
+    if (matches.length !== 1) return null;
+    const platform = matches[0].slice(0, -suffix.length);
+    return { platform, userId: txn.user_id };
+  }
+
+  /**
+   * Read the raw session object for a transaction's customer. Uses the
+   * live engine's sessionManager when initialized (sees in-memory writes
+   * before they hit disk), otherwise falls back to reading the file.
+   * Returns null when the session doesn't exist yet.
+   */
+  function loadTxnSession(target) {
+    if (!target) return null;
+    if (engine?.initialized && engine.sessionManager) {
+      return engine.sessionManager.getSession(target.platform, target.userId);
+    }
+    const safe = `${target.platform}_${target.userId}`.replace(/[^a-zA-Z0-9_\-]/g, '_');
+    const sessionFp = path.join(workspace, '.aaas', 'sessions', `${safe}.json`);
+    return readJson(sessionFp);
+  }
+
+  router.get('/transactions/:id/conversation', async (req, res) => {
+    const txn = findTransaction(paths, req.params.id);
+    if (!txn) return res.status(404).json({ error: 'Transaction not found' });
+
+    const target = resolveTxnSession(txn);
+    if (!target) {
+      return res.status(409).json({ error: 'Could not determine the customer session for this transaction.' });
+    }
+
+    try {
+      const session = loadTxnSession(target);
+      res.json({
+        messages: session?.messages || [],
+        paused: !!session?.meta?.paused,
+        paused_at: session?.meta?.paused_at || null,
+        customer: {
+          platform: target.platform,
+          user_id: target.userId,
+          user_name: txn.user_name || target.userId,
+        },
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  /**
+   * Pause the agent on this transaction's session. While paused, the
+   * agent ignores incoming customer messages (they're still recorded) and
+   * the admin can send messages directly to the customer via the
+   * /admin-message endpoint.
+   */
+  router.post('/transactions/:id/pause', async (req, res) => {
+    const txn = findTransaction(paths, req.params.id);
+    if (!txn) return res.status(404).json({ error: 'Transaction not found' });
+    const target = resolveTxnSession(txn);
+    if (!target) {
+      return res.status(409).json({ error: 'Could not determine the customer session for this transaction.' });
+    }
+    try {
+      const eng = await getEngine();
+      const now = new Date().toISOString();
+      eng.sessionManager.setSessionMeta(target.platform, target.userId, 'paused', true);
+      eng.sessionManager.setSessionMeta(target.platform, target.userId, 'paused_at', now);
+      res.json({ ok: true, paused: true, paused_at: now });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  /**
+   * Resume the agent on this transaction's session. The agent will pick
+   * up the next incoming customer message with full conversation history
+   * including anything the admin said during the intervention.
+   */
+  router.post('/transactions/:id/unpause', async (req, res) => {
+    const txn = findTransaction(paths, req.params.id);
+    if (!txn) return res.status(404).json({ error: 'Transaction not found' });
+    const target = resolveTxnSession(txn);
+    if (!target) {
+      return res.status(409).json({ error: 'Could not determine the customer session for this transaction.' });
+    }
+    try {
+      const eng = await getEngine();
+      eng.sessionManager.setSessionMeta(target.platform, target.userId, 'paused', null);
+      eng.sessionManager.setSessionMeta(target.platform, target.userId, 'paused_at', null);
+      res.json({ ok: true, paused: false });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  /**
+   * Direct admin intervention. The admin's message goes straight to the
+   * customer on their platform — the agent is NOT invoked. Allowed ONLY
+   * when the session is paused (the explicit "I'm taking over" gate).
+   *
+   * The message is also appended to the session as a synthetic record so
+   * the conversation panel renders it as an Admin bubble (the existing
+   * MessageBubble component detects the `[ADMIN MESSAGE FROM DASHBOARD]`
+   * prefix). When the agent is later resumed it sees this as context.
+   */
+  router.post('/transactions/:id/admin-message', async (req, res) => {
+    const txn = findTransaction(paths, req.params.id);
+    if (!txn) return res.status(404).json({ error: 'Transaction not found' });
+
+    const target = resolveTxnSession(txn);
+    if (!target) {
+      return res.status(409).json({ error: 'Could not determine the customer session for this transaction.' });
+    }
+
+    const message = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
+    if (!message) return res.status(400).json({ error: 'message is required' });
+
+    // Gate on pause: admin must explicitly take over before sending.
+    const session = loadTxnSession(target);
+    if (!session?.meta?.paused) {
+      return res.status(409).json({
+        error: 'Pause the agent before sending messages to the customer.',
+        paused: false,
+      });
+    }
+
+    const result = await sendDirectToCustomer(workspace, target.platform, target.userId, message);
+    if (!result.ok) {
+      return res.status(502).json({ error: result.error });
+    }
+
+    // Append to session so it appears in the conversation panel and so the
+    // agent has the full context when later resumed.
+    try {
+      const eng = await getEngine();
+      eng.sessionManager?.addMessage(target.platform, target.userId, {
+        role: 'user',
+        content: `[ADMIN MESSAGE FROM DASHBOARD] ${message}`,
+      });
+    } catch { /* best-effort; delivery already succeeded */ }
+
+    res.json({ ok: true, delivered: true });
+  });
 
   router.get('/transactions-stats', (req, res) => {
     const all = loadAllTransactions(paths, true);

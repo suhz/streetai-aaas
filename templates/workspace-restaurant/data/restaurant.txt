@@ -1,0 +1,6 @@
+Welcome to {{RESTAURANT_SHORT}} — {{TAGLINE}}
+
+📍 {{LOCATION}}
+⏰ Open daily: {{HOURS_DAILY}}
+📞 Reservations: {{PHONE}}
+🌐 {{WEBSITE}}

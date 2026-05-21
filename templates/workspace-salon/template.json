@@ -1,0 +1,6 @@
+{
+  "name": "Salon",
+  "description": "Service list, appointments, and stylist preferences. Built for hair salons, barbers, nail salons, and similar.",
+  "image": "preview.png",
+  "type": "salon"
+}

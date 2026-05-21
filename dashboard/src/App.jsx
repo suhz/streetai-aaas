@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { Routes, Route, NavLink, useParams, useNavigate, useLocation } from 'react-router-dom';
 import { WorkspaceContext } from './hooks/useApi.js';
 import { ThemeContext, useThemeState } from './hooks/useTheme.js';
+import { NavModeContext, useNavModeStore, useNavMode } from './hooks/useNavMode.js';
 import Overview from './pages/Overview.jsx';
 import Skill from './pages/Skill.jsx';
 import Soul from './pages/Soul.jsx';
@@ -71,6 +72,31 @@ function workspaceNav(prefix) {
         { path: `${prefix}/payments`, label: 'Payments', icon: <IconCard /> },
         { path: `${prefix}/settings`, label: 'Settings', icon: <IconGear /> },
       ]
+    },
+  ];
+}
+
+/**
+ * Simplified flat nav for non-technical roles (e.g. restaurant operators).
+ * No section headers; only day-to-day pages plus Settings so the user can
+ * always switch back to admin nav.
+ *
+ * Setup Guide, Skill/Soul/Extensions, Data/Memory, and Deploy are all
+ * hidden — they're owner/setup-time concerns. Notifications and Payments
+ * stay because operators do consult them.
+ */
+function basicNav(prefix) {
+  return [
+    {
+      section: '',
+      items: [
+        { path: `${prefix}`, label: 'Overview', icon: <IconGrid /> },
+        { path: `${prefix}/transactions`, label: 'Transactions', icon: <IconReceipt /> },
+        { path: `${prefix}/chat`, label: 'Chat', icon: <IconChat /> },
+        { path: `${prefix}/notifications`, label: 'Notifications', icon: <IconBell /> },
+        { path: `${prefix}/payments`, label: 'Payments', icon: <IconCard /> },
+        { path: `${prefix}/settings`, label: 'Settings', icon: <IconGear /> },
+      ],
     },
   ];
 }
@@ -160,7 +186,8 @@ function Sidebar({ navItems, mode, onLogoClick, workspaceName }) {
 function WorkspaceView() {
   const { wsName } = useParams();
   const prefix = `/ws/${wsName}`;
-  const navItems = workspaceNav(prefix);
+  const { navMode } = useNavMode(wsName);
+  const navItems = navMode === 'basic' ? basicNav(prefix) : workspaceNav(prefix);
 
   return (
     <WorkspaceContext.Provider value={wsName}>
@@ -259,7 +286,9 @@ function HubLayout() {
 
 function StandaloneLayout() {
   const navigate = useNavigate();
-  const navItems = workspaceNav('');
+  // Standalone mode has no workspace name — uses the synthetic _standalone key.
+  const { navMode } = useNavMode(null);
+  const navItems = navMode === 'basic' ? basicNav('') : workspaceNav('');
   const unseenTxns = useUnseenTransactions();
   const decoratedNav = withTransactionsBadge(navItems, unseenTxns, '');
 
@@ -294,6 +323,7 @@ function StandaloneLayout() {
 export default function App() {
   const [mode, setMode] = useState(null);
   const themeState = useThemeState();
+  const navModeStore = useNavModeStore();
 
   useEffect(() => {
     fetch('/api/mode')
@@ -315,7 +345,9 @@ export default function App() {
 
   return (
     <ThemeContext.Provider value={themeState}>
-      {content}
+      <NavModeContext.Provider value={navModeStore}>
+        {content}
+      </NavModeContext.Provider>
     </ThemeContext.Provider>
   );
 }
