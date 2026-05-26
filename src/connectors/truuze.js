@@ -661,15 +661,19 @@ export default class TruuzeConnector extends BaseConnector {
     const title = escrow.title || 'service';
     const chatId = escrow.chat_id;
     const userUsername = escrow.user?.username || escrow.user_username || null;
+    const userPk = escrow.user?.id ?? escrow.user_id ?? null;
 
     const content = this._formatEscrowNotice(action, escrow, ref, title);
 
     const event = {
       platform: 'truuze',
       // Route into the customer's chat session if we know who it is, so the
-      // agent's reply lands in the right context. Falls back to a synthetic
-      // platform id when the username isn't surfaced by the API.
-      userId: userUsername || 'truuze-platform',
+      // agent's reply lands in the right context. Keyed by user_id so it
+      // matches the session created by the customer's own messages (which
+      // also key by user_id). Falls back to username, then synthetic.
+      userId: userPk != null
+        ? String(userPk)
+        : (userUsername || 'truuze-platform'),
       userName: userUsername ? `@${userUsername}` : 'Truuze Platform',
       type: 'platform_event',
       content,
@@ -771,17 +775,30 @@ export default class TruuzeConnector extends BaseConnector {
     const isOwner = this.ownerUsername && msg.from_username === this.ownerUsername;
     const isSystem = msg.message_type === 'system';
 
-    // For system messages, find the other participant's username from chat history
-    // so the message lands in the correct user session (not a separate "system" session)
+    // For system messages, find the other participant's stable user_id from
+    // chat history so the message lands in the same session file as their
+    // regular messages (which post-flip key by user_id). Using sender_id
+    // here keeps the two streams unified — using sender_username would
+    // split bobby's regular session (truuze_4.json) from any system events
+    // about him (which would land in truuze_bobby.json).
     let systemSessionUser = null;
     if (isSystem && msg.history?.length) {
-      const otherMsg = msg.history.find(h => !h.is_you && h.sender_username);
-      systemSessionUser = otherMsg?.sender_username;
+      const otherMsg = msg.history.find(h => !h.is_you && h.sender_id != null);
+      systemSessionUser = otherMsg ? String(otherMsg.sender_id) : null;
     }
 
     const event = {
       platform: 'truuze',
-      userId: isSystem ? (systemSessionUser || 'system') : (msg.from_username || String(msg.from_user_id)),
+      // Key sessions and memory by the stable Truuze user_id, not the
+      // username — username can change (e.g. anonymous → signed-up flow)
+      // and would orphan the agent's memory file. Falls back to username
+      // only if user_id isn't surfaced by the API (shouldn't happen, but
+      // defensive).
+      userId: isSystem
+        ? (systemSessionUser || 'system')
+        : (msg.from_user_id != null
+            ? String(msg.from_user_id)
+            : msg.from_username),
       userName: isSystem ? 'Truuze System' : (msg.from_name || msg.from_username),
       type: 'message',
       content: isSystem ? content : content,
