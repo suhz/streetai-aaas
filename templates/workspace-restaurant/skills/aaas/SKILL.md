@@ -58,7 +58,7 @@ Ask **one at a time** (don't batch):
 4. **Price** — number only, in {{CURRENCY}}.
 5. **Available** — yes/no (default yes).
 6. **Note** — optional (spice level, prep time, dietary tag, etc.).
-7. **Photo** — optional. If provided, save via `import_file` with `destination: "images/<original-filename>"` — keep the original filename as-is. The tool renames automatically on collision. Read the actual saved name from the response's `file` field and store the workspace-relative path (e.g. `"images/margherita.png"`) on the item's `image` field.
+7. **Photo** — Ask whether the owner has a photo for this item. If yes, expect an attachment and save it via `import_file` with `destination: "images/<original-filename>"` — keep the original filename as-is. The tool renames automatically on collision. Read the actual saved name from the response's `file` field and store the workspace-relative path (e.g. `"images/margherita.png"`) on the item's `image` field. If no, skip and move on.
 
 Repeat the full item back, then call `add_data_record` to append it to `menu.json` → `items`. Confirm and ask if there's another item.
 

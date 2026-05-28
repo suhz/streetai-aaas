@@ -307,32 +307,71 @@ export default class TelegramConnector extends BaseConnector {
       }
     }
 
-    // Send text response with retry
+    // Send text response. Three-stage format fallback driven by the failure
+    // cause:
+    //   1. Markdown (as-is). Works for clean agent output.
+    //   2. HTML — only computed if stage 1 was rejected with a parse error.
+    //      Converts agent markdown to Telegram's HTML subset, which has fewer
+    //      ambiguities than legacy Markdown.
+    //   3. Plain text — final fallback. Message lands without formatting.
+    //
+    // Transport errors retry the same payload with backoff (up to 3 attempts).
+    // Non-parse HTTP errors (bad chat_id, blocked, too long, etc.) bail
+    // immediately — retrying the same payload won't help.
     if (response) {
       const chunks = this._splitMessage(response, 4096);
       for (const chunk of chunks) {
-        for (let attempt = 1; attempt <= 3; attempt++) {
-          try {
-            const resp = await fetch(`${this.apiBase}/sendMessage`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                chat_id: chatId,
-                text: chunk,
-                parse_mode: 'Markdown',
-              }),
-            });
-            if (resp.ok) break;
-            console.warn(`[telegram] Send attempt ${attempt}/3 failed: HTTP ${resp.status}`);
-            if (attempt < 3) await this._sleep(2000);
-            else console.error('[telegram] Failed to send message after 3 attempts');
-          } catch (err) {
-            console.warn(`[telegram] Send attempt ${attempt}/3 failed: ${err.message}`);
-            if (attempt < 3) await this._sleep(2000);
-            else console.error('[telegram] Failed to send message after 3 attempts');
+        await this._sendText(chatId, chunk);
+      }
+    }
+  }
+
+  async _sendText(chatId, chunk) {
+    // Build each stage's payload lazily so the HTML converter only runs if
+    // Markdown is actually rejected — clean messages never pay for it.
+    const stages = [
+      () => ({ label: 'markdown', body: { text: chunk, parse_mode: 'Markdown' } }),
+      () => ({ label: 'html', body: { text: markdownToTelegramHtml(chunk), parse_mode: 'HTML' } }),
+      () => ({ label: 'plain', body: { text: chunk } }),
+    ];
+
+    for (const buildStage of stages) {
+      const { label, body: payload } = buildStage();
+      const body = { chat_id: chatId, ...payload };
+      let advanceStage = false;
+
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          const resp = await fetch(`${this.apiBase}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+          });
+          if (resp.ok) return;
+
+          const errBody = await resp.json().catch(() => ({}));
+          const desc = errBody?.description || '';
+
+          if (resp.status === 400 && /parse|entities/i.test(desc)) {
+            console.warn(`[telegram] ${label} rejected (${desc}); trying next strategy`);
+            advanceStage = true;
+            break;  // exit attempt loop, advance to next stage
+          }
+
+          console.error(`[telegram] Send failed: HTTP ${resp.status}${desc ? ` — ${desc}` : ''}`);
+          return;  // non-parse HTTP error — no stage will help
+        } catch (err) {
+          console.warn(`[telegram] Send attempt ${attempt}/3 failed (transport): ${err.message}`);
+          if (attempt < 3) {
+            await this._sleep(2000);
+          } else {
+            console.error('[telegram] Failed to send message after 3 attempts');
+            return;  // transport exhausted — no stage will reach Telegram either
           }
         }
       }
+
+      if (!advanceStage) return;  // shouldn't happen, but defensive
     }
   }
 
@@ -538,6 +577,7 @@ export default class TelegramConnector extends BaseConnector {
   }
 }
 
+
 /**
  * Static "send arbitrary text to a Telegram chat" helper.
  *
@@ -578,4 +618,75 @@ export async function sendDirect(workspace, chatId, text) {
   } catch (err) {
     return { ok: false, error: err.message };
   }
+}
+
+/**
+ * Convert agent-emitted GitHub-flavored markdown into Telegram's HTML subset.
+ *
+ * Telegram HTML is narrow and well-defined: <b>, <i>, <u>, <s>, <code>, <pre>,
+ * <a href="">. Special chars <, >, & must be entity-escaped outside of code
+ * blocks. Far fewer ambiguities than legacy `Markdown`, which trips over
+ * bullet asterisks, underscores in filenames, and unbalanced markers.
+ *
+ * The converter handles the common subset agents produce and leaves anything
+ * unrecognized as escaped text. If Telegram still rejects the result, the
+ * caller falls back to plain text.
+ */
+function markdownToTelegramHtml(text) {
+  if (!text) return text;
+
+  // 1. Stash code blocks and inline code so their contents aren't processed
+  //    as markdown. Placeholder uses a NUL byte that won't appear in input.
+  const stash = [];
+  const placeholder = (content, tag) => {
+    stash.push({ content, tag });
+    return `\x00${stash.length - 1}\x00`;
+  };
+
+  let out = text
+    .replace(/```([\s\S]*?)```/g, (_, code) => placeholder(escapeHtml(code), 'pre'))
+    .replace(/`([^`\n]+)`/g, (_, code) => placeholder(escapeHtml(code), 'code'));
+
+  // 2. Process line-starting markers (bullets, headings) BEFORE escaping HTML
+  //    so we can rewrite them cleanly.
+  out = out.split('\n').map(line => {
+    const bullet = line.match(/^(\s*)[*\-+]\s+(.+)$/);
+    if (bullet) return `${bullet[1]}• ${bullet[2]}`;
+    const heading = line.match(/^#{1,6}\s+(.+)$/);
+    if (heading) return `<<<H>>>${heading[1]}<<</H>>>`;  // marker swapped below
+    return line;
+  }).join('\n');
+
+  // 3. Escape HTML entities in the remaining text.
+  out = escapeHtml(out);
+
+  // 4. Restore heading markers as <b> (Telegram HTML has no heading tag).
+  out = out.replace(/&lt;&lt;&lt;H&gt;&gt;&gt;/g, '<b>').replace(/&lt;&lt;&lt;\/H&gt;&gt;&gt;/g, '</b>');
+
+  // 5. Inline formatting. Order matters: bold (**, __) before italic (*, _)
+  //    so `**bold**` isn't mis-read as two italics.
+  out = out
+    .replace(/\*\*([^*\n]+?)\*\*/g, '<b>$1</b>')
+    .replace(/__([^_\n]+?)__/g, '<b>$1</b>')
+    .replace(/(^|[^\w*])\*([^*\n]+?)\*(?=[^\w*]|$)/g, '$1<i>$2</i>')
+    .replace(/(^|[^\w_])_([^_\n]+?)_(?=[^\w_]|$)/g, '$1<i>$2</i>')
+    .replace(/~~([^~\n]+?)~~/g, '<s>$1</s>');
+
+  // 6. Links: [text](url). URL needs its own escape pass for href quoting.
+  out = out.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, label, url) => {
+    const safeUrl = url.replace(/"/g, '&quot;');
+    return `<a href="${safeUrl}">${label}</a>`;
+  });
+
+  // 7. Restore code placeholders with their tags.
+  out = out.replace(/\x00(\d+)\x00/g, (_, idx) => {
+    const { content, tag } = stash[Number(idx)];
+    return tag === 'pre' ? `<pre><code>${content}</code></pre>` : `<code>${content}</code>`;
+  });
+
+  return out;
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }

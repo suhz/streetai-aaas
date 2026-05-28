@@ -55,7 +55,7 @@ Ask **one at a time** (don't batch):
 5. **Available** — yes/no (default yes).
 6. **Variant / options** — optional (sizes, colors). Skip if not applicable.
 7. **Note** — optional (material, care, warranty, etc.).
-8. **Photo** — optional. If provided, save via `import_file` with `destination: "images/<original-filename>"` — keep the original filename as-is. The tool renames automatically on collision. Read the actual saved name from the response's `file` field and store the workspace-relative path (e.g. `"images/red-mug.png"`) on the item's `image` field.
+8. **Photo** — Ask whether the owner has a photo for this product. If yes, expect an attachment and save it via `import_file` with `destination: "images/<original-filename>"` — keep the original filename as-is. The tool renames automatically on collision. Read the actual saved name from the response's `file` field and store the workspace-relative path (e.g. `"images/red-mug.png"`) on the item's `image` field. If no, skip and move on.
 
 Repeat the full product back, then call `add_data_record` to append it to `products.json` → `items`. Confirm and ask if there's another.
 

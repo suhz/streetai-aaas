@@ -57,7 +57,7 @@ Ask **one at a time** (don't batch):
 5. **Duration (minutes)** — typical duration. Use `0` if it varies.
 6. **Available** — yes/no (default yes).
 7. **Note** — optional (intake requirements, on-site vs in-office, what to bring, etc.).
-8. **Photo** — optional. If provided, save via `import_file` with `destination: "images/<original-filename>"` — keep the original filename as-is. The tool renames automatically on collision. Read the actual saved name from the response's `file` field and store the workspace-relative path (e.g. `"images/leak-repair.png"`) on the item's `image` field.
+8. **Photo** — Ask whether the owner has a photo for this service. If yes, expect an attachment and save it via `import_file` with `destination: "images/<original-filename>"` — keep the original filename as-is. The tool renames automatically on collision. Read the actual saved name from the response's `file` field and store the workspace-relative path (e.g. `"images/leak-repair.png"`) on the item's `image` field. If no, skip and move on.
 
 Repeat the full service back, then call `add_data_record` to append it to `services.json` → `items`. Confirm and ask if there's another.
 
