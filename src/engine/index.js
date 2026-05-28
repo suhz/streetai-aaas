@@ -307,7 +307,7 @@ export class AgentEngine {
     // `mode` was resolved earlier (step 2b) — reused here for the base prompt.
     // `now` is sampled fresh per turn so the model's authoritative clock
     // doesn't drift across long-lived engine instances.
-    this.basePrompt = buildBasePrompt(this.paths, { mode, now: new Date() });
+    this.basePrompt = buildBasePrompt(this.paths, { mode, now: new Date(), platform });
 
     // Expose the current event to tools so notify_owner can capture context.
     if (this.toolRegistry?.setEventContext) {

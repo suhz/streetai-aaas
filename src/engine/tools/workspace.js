@@ -437,16 +437,50 @@ export function importFile(paths, { source, destination }) {
 
   // Allow subdirectories but prevent path traversal
   const safe = destination.replace(/\.\./g, '').replace(/\\/g, '/');
-  const dest = path.resolve(paths.data, safe);
-  if (!dest.startsWith(path.resolve(paths.data))) {
+  const requestedDest = path.resolve(paths.data, safe);
+  if (!requestedDest.startsWith(path.resolve(paths.data))) {
     return JSON.stringify({ error: 'Invalid destination path.' });
   }
 
-  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  fs.mkdirSync(path.dirname(requestedDest), { recursive: true });
+
+  // Rename on collision: if "images/foo.png" exists, save as "images/foo-2.png",
+  // "foo-3.png", etc. Keeps the agent's intent (original filename) while never
+  // silently overwriting a file the owner already attached.
+  const { dest, finalRelPath, renamed } = resolveCollision(paths.data, requestedDest, safe);
+
   fs.copyFileSync(resolvedSource, dest);
 
   const stat = fs.statSync(dest);
-  return JSON.stringify({ ok: true, message: `File imported to data/${safe}.`, file: safe, size: stat.size });
+  return JSON.stringify({
+    ok: true,
+    message: renamed
+      ? `File imported to data/${finalRelPath} (renamed from ${safe} — a file with that name already existed).`
+      : `File imported to data/${finalRelPath}.`,
+    file: finalRelPath,
+    renamed,
+    size: stat.size,
+  });
+}
+
+function resolveCollision(dataRoot, requestedAbs, requestedRel) {
+  if (!fs.existsSync(requestedAbs)) {
+    return { dest: requestedAbs, finalRelPath: requestedRel, renamed: false };
+  }
+  const dir = path.dirname(requestedAbs);
+  const ext = path.extname(requestedAbs);
+  const base = path.basename(requestedAbs, ext);
+  for (let n = 2; n < 1000; n++) {
+    const candidate = path.join(dir, `${base}-${n}${ext}`);
+    if (!fs.existsSync(candidate)) {
+      const finalRelPath = path.relative(dataRoot, candidate).replace(/\\/g, '/');
+      return { dest: candidate, finalRelPath, renamed: true };
+    }
+  }
+  // 1000 collisions is pathological — fall back to a timestamp.
+  const candidate = path.join(dir, `${base}-${Date.now()}${ext}`);
+  const finalRelPath = path.relative(dataRoot, candidate).replace(/\\/g, '/');
+  return { dest: candidate, finalRelPath, renamed: true };
 }
 
 /**

@@ -28,9 +28,13 @@ export default function Chat() {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
+  // Focus the textarea whenever it becomes usable — on mount once the provider
+  // is configured, and after each agent response when `sending` flips back to
+  // false. Runs after React re-enables the disabled textarea, so focus takes
+  // (a synchronous focus() call right after setSending(false) would no-op).
   useEffect(() => {
-    if (hasProvider) inputRef.current?.focus();
-  }, [hasProvider]);
+    if (!sending && hasProvider) inputRef.current?.focus();
+  }, [sending, hasProvider]);
 
   // Load chat history from session on mount.
   // Each mode has its own session — when switching, replace messages with
@@ -149,7 +153,6 @@ export default function Chat() {
       setError(e.message);
     }
     setSending(false);
-    inputRef.current?.focus();
   }
 
   async function handleResend() {
@@ -181,7 +184,6 @@ export default function Chat() {
       setError(e.message);
     }
     setSending(false);
-    inputRef.current?.focus();
   }
 
   function handleKeyDown(e) {

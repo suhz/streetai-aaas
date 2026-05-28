@@ -41,6 +41,12 @@ export function hubRouter(hubDir) {
       const nameMatch = skill.match(/^#\s+(.+)/m);
       const agentName = nameMatch ? nameMatch[1].replace(/\s*—.*/, '').trim() : entry.name;
 
+      // Description lives in .aaas/config.json — written on workspace create
+      // and edit. We deliberately do NOT fall back to parsing SKILL.md:
+      // legacy workspaces without the field just show no description until
+      // the owner edits them.
+      const description = config.description || '';
+
       // Check connections (and attach in-process status for each platform)
       const connectionsDir = path.join(wsPath, '.aaas', 'connections');
       const connections = [];
@@ -117,6 +123,7 @@ export function hubRouter(hubDir) {
 
       workspaces.push({
         name: agentName,
+        description,
         directory: entry.name,
         path: wsPath,
         photo,
@@ -442,11 +449,12 @@ export function hubRouter(hubDir) {
         const avatarPath = path.join(target, '.aaas', `avatar.${ext}`);
         fs.writeFileSync(avatarPath, req.file.buffer);
       }
-      // Copy hub config so the new workspace inherits LLM provider/model
-      const srcConfig = readJson(path.join(hubDir, '.aaas', 'config.json'));
-      if (srcConfig) {
-        writeJson(path.join(target, '.aaas', 'config.json'), srcConfig);
-      }
+      // Copy hub config so the new workspace inherits LLM provider/model,
+      // then stamp the owner-supplied description onto it. Description is
+      // workspace-specific so it always overrides anything inherited.
+      const srcConfig = readJson(path.join(hubDir, '.aaas', 'config.json')) || {};
+      if (description && description.trim()) srcConfig.description = description.trim();
+      writeJson(path.join(target, '.aaas', 'config.json'), srcConfig);
       registerWorkspace(target, name);
       return res.json({ ok: true, directory: dirName, path: target, template: String(template).trim() });
     }
@@ -585,11 +593,11 @@ I am ${displayName}. I provide real value to real people through conversation.
       fs.writeFileSync(path.join(target, dir, '.gitkeep'), '');
     }
 
-    // Copy hub config to new workspace if it exists
-    const srcConfig = readJson(path.join(hubDir, '.aaas', 'config.json'));
-    if (srcConfig) {
-      writeJson(path.join(target, '.aaas', 'config.json'), srcConfig);
-    }
+    // Copy hub config to new workspace, then stamp the owner-supplied
+    // description onto it (workspace-specific, overrides anything inherited).
+    const srcConfig = readJson(path.join(hubDir, '.aaas', 'config.json')) || {};
+    if (description && description.trim()) srcConfig.description = description.trim();
+    writeJson(path.join(target, '.aaas', 'config.json'), srcConfig);
 
     // Save uploaded photo
     if (req.file) {
@@ -622,13 +630,22 @@ I am ${displayName}. I provide real value to real people through conversation.
       skill = skill.replace(/\*\*Name:\*\*\s+.+/, `**Name:** ${name}`);
     }
 
-    if (description !== undefined) {
-      skill = skill.replace(/\*\*Service:\*\*\s+.+/, `**Service:** ${description}`);
-    }
-
     fs.writeFileSync(skillPath, skill);
 
     const aaasDir = path.join(wsPath, '.aaas');
+
+    // Description lives in .aaas/config.json (the canonical source for the
+    // dashboard card). SKILL.md's `**Service:**` line is the agent's own
+    // self-description in its prompt; we don't touch it from here so the
+    // two can evolve independently.
+    if (description !== undefined) {
+      const configPath = path.join(aaasDir, 'config.json');
+      const cfg = readJson(configPath) || {};
+      const trimmed = String(description).trim();
+      if (trimmed) cfg.description = trimmed;
+      else delete cfg.description;
+      writeJson(configPath, cfg);
+    }
 
     // Remove photo if requested
     if (req.body.removePhoto === 'true') {

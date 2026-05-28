@@ -24,32 +24,36 @@ export async function searchData(paths, { query, file, field, value, table, sql 
   for (const f of files) {
     const fp = path.join(dataDir, f);
     const data = readJson(fp);
-    if (!Array.isArray(data)) continue;
+    const recordSets = collectRecordArrays(data);
 
-    for (const record of data) {
+    for (const { records } of recordSets) {
+      for (const record of records) {
+        if (results.length >= maxResults) break;
+        if (!record || typeof record !== 'object') continue;
+
+        let matches = false;
+
+        // Field-specific match
+        if (field && value) {
+          const fieldVal = String(record[field] || '').toLowerCase();
+          matches = fieldVal.includes(value.toLowerCase());
+        }
+
+        // Full-text search across all string fields
+        if (query && !matches) {
+          const q = query.toLowerCase();
+          matches = Object.values(record).some(v => {
+            if (typeof v === 'string') return v.toLowerCase().includes(q);
+            if (Array.isArray(v)) return v.some(item => String(item).toLowerCase().includes(q));
+            return false;
+          });
+        }
+
+        if (matches) {
+          results.push({ _source: f, ...record });
+        }
+      }
       if (results.length >= maxResults) break;
-
-      let matches = false;
-
-      // Field-specific match
-      if (field && value) {
-        const fieldVal = String(record[field] || '').toLowerCase();
-        matches = fieldVal.includes(value.toLowerCase());
-      }
-
-      // Full-text search across all string fields
-      if (query && !matches) {
-        const q = query.toLowerCase();
-        matches = Object.values(record).some(v => {
-          if (typeof v === 'string') return v.toLowerCase().includes(q);
-          if (Array.isArray(v)) return v.some(item => String(item).toLowerCase().includes(q));
-          return false;
-        });
-      }
-
-      if (matches) {
-        results.push({ _source: f, ...record });
-      }
     }
   }
 
@@ -146,4 +150,31 @@ function searchSqlite(paths, { query, table, field, value, sql }) {
   } catch (err) {
     return JSON.stringify({ error: err.message });
   }
+}
+
+/**
+ * Collect searchable record arrays from a parsed JSON value.
+ *
+ * - Top-level array → returned as-is (preserves existing behavior).
+ * - Top-level object → returns any array-valued property whose elements
+ *   are objects (e.g. `menu.json` → `items`, `products.json` → `items`).
+ *   Reference dicts like `category_images: {}` are ignored.
+ * - Top-level object with no record arrays → treated as a single record
+ *   so settings/config files remain searchable.
+ * - Anything else → empty (skip the file).
+ */
+function collectRecordArrays(data) {
+  if (Array.isArray(data)) return [{ key: '', records: data }];
+  if (!data || typeof data !== 'object') return [];
+
+  const sets = [];
+  for (const [key, val] of Object.entries(data)) {
+    if (!Array.isArray(val) || val.length === 0) continue;
+    const first = val[0];
+    if (first && typeof first === 'object' && !Array.isArray(first)) {
+      sets.push({ key, records: val });
+    }
+  }
+  if (sets.length === 0) sets.push({ key: '', records: [data] });
+  return sets;
 }

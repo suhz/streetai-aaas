@@ -50,14 +50,14 @@ When the owner says "add services," "edit the catalog," or similar, run the flow
 
 Ask **one at a time** (don't batch):
 
-1. **Category** — list existing categories from `services.json`. Owner can pick one or name a new one. If new, ask for a category image; save via `import_file` to `data/images/<category-slug>.jpg`, then add the entry to `services.json` → `category_images`. Never write the entry before the file exists on disk.
+1. **Category** — list existing categories from `services.json`. Owner can pick one or name a new one. If new, ask for a category image; save via `import_file` with `destination: "images/<original-filename>"` — keep the original filename as-is. The tool renames automatically if a file already exists (`foo.png` → `foo-2.png`); use the `file` value from the response when writing into `services.json` → `category_images`. Never write the entry before the file exists on disk.
 2. **Name** — required.
 3. **Description** — short, 1–2 lines.
 4. **Price** — number in {{CURRENCY}}, or `0` for quote-based services.
 5. **Duration (minutes)** — typical duration. Use `0` if it varies.
 6. **Available** — yes/no (default yes).
 7. **Note** — optional (intake requirements, on-site vs in-office, what to bring, etc.).
-8. **Photo** — optional. If provided, save via `import_file` to `data/images/<service-slug>.jpg` and store the path on the item's `image` field.
+8. **Photo** — optional. If provided, save via `import_file` with `destination: "images/<original-filename>"` — keep the original filename as-is. The tool renames automatically on collision. Read the actual saved name from the response's `file` field and store the workspace-relative path (e.g. `"images/leak-repair.png"`) on the item's `image` field.
 
 Repeat the full service back, then call `add_data_record` to append it to `services.json` → `items`. Confirm and ask if there's another.
 
@@ -113,8 +113,9 @@ When a customer messages you for the first time:
 
 1. Read `services.json` (or `search_data` for specific keywords).
 2. If categories exist, list categories first → let customer pick.
-3. If a category has an image in `services.json` → `category_images`, render it: `![Category](/api/workspace/data/PATH)`.
+3. **Category image is required when one exists.** When the customer picks a category, look up `services.json` → `category_images[CategoryName]`. If a path is set, you must render it before listing items: `![Category Name](/api/workspace/data/PATH)` — substitute PATH with the exact stored value. If no image is set, skip this step.
 4. For each service, show: name, typical duration, price ({{CURRENCY}}) or "quote-based" if no fixed price, brief description.
+5. **Item image:** if a service has an `image` field, render it above the service line: `![Service Name](/api/workspace/data/<image>)`. Substitute the exact value of the `image` field.
 
 **Setup order for `category_images`:** never write an entry until the image file actually exists under `data/images/`. If a file is on disk but named differently, use `rename_data_file` to align it, then write the entry. Don't fabricate filenames.
 

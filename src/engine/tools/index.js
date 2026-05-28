@@ -652,12 +652,12 @@ export class ToolRegistry {
       },
       {
         name: 'import_file',
-        description: 'Import an uploaded file into the data/ directory. Use this when the user attaches a file and you need to save it to your workspace.',
+        description: 'Import an uploaded file into the data/ directory. Use this when the user attaches a file and you need to save it to your workspace. If a file with the same destination already exists, it will be saved with a numeric suffix instead (e.g. "foo.png" → "foo-2.png") to avoid overwriting. The response\'s `file` field is the actual saved path — use that when storing references.',
         parameters: {
           type: 'object',
           properties: {
             source: { type: 'string', description: 'Full path to the uploaded file.' },
-            destination: { type: 'string', description: 'Filename to save as in data/ (e.g., "products.json", "logo.png").' },
+            destination: { type: 'string', description: 'Filename to save as in data/ (e.g., "images/main_course.png"). Prefer the original filename when reasonable.' },
           },
           required: ['source', 'destination'],
         },

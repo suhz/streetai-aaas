@@ -4,8 +4,7 @@
   "auto_fill_from_workspace_name": ["RESTAURANT_NAME", "RESTAURANT_SHORT", "AGENT_NAME"],
   "variables": [
     { "key": "AGENT_NAME", "prompt": "What should the agent call itself in chat? (e.g. 'CP', 'Maya')", "required": true },
-    { "key": "CUISINE_LONG", "prompt": "Cuisine — full descriptor (e.g. 'Malabar / Kerala coastal', 'Neapolitan pizza', 'Levantine')", "required": true },
-    { "key": "CUISINE_SHORT", "prompt": "Cuisine — short label for tagline (e.g. 'Malabar', 'Italian')", "required": true },
+    { "key": "CUISINE", "prompt": "Cuisine (e.g. 'Italian', 'Malabar Kerala coastal', 'Neapolitan pizza', 'Levantine')", "required": true },
     { "key": "REGION", "prompt": "Country or region you operate in (e.g. 'UAE', 'New York')", "required": true },
     { "key": "LANGUAGES", "prompt": "Languages the agent should speak (e.g. 'English', 'English, Arabic')", "default": "English" },
     { "key": "CURRENCY", "prompt": "Currency code (3 letters: AED, USD, EUR, GBP, INR...)", "required": true, "validate": "^[A-Z]{3}$" },

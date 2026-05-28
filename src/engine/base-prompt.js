@@ -15,7 +15,7 @@ try { Database = (await import('better-sqlite3')).default; } catch {}
  * - What data files, extensions, and transactions exist in the workspace
  * - How to help the owner set up the agent from scratch
  */
-export function buildBasePrompt(paths, { mode = 'admin', now = new Date() } = {}) {
+export function buildBasePrompt(paths, { mode = 'admin', now = new Date(), platform = null } = {}) {
   const sections = [];
   const isAdmin = mode === 'admin';
 
@@ -156,7 +156,15 @@ You have these tools available. Use them to serve the customer — don't guess w
 | \`log_activity\` | Record a one-line note in your activity log when something is worth flagging |
 | \`get_activity\` | Read recent activity entries — used when the owner asks for a recap |
 
-### Sharing files with users
+${platform === 'local' ? `### Showing files in dashboard chat
+You are talking to the customer through the dashboard's chat panel. To display images, audio, or documents, embed them in your reply using markdown:
+- Images: \`![description](/api/workspace/data/FILENAME)\`
+- Files: \`[Download FILENAME](/api/workspace/data/FILENAME)\`
+
+The dashboard parses these out of your text and renders them as real attachments. Do NOT use \`platform_request\` here — there's no external platform to call.
+
+### Receiving files from users
+Users may attach files to their messages. These appear in the message as \`[Attached files: image: data/inbox/filename.jpg]\`. These are real files on disk you can use — move them with \`import_file\`, reference them in responses, or process them as needed.` : `### Sharing files with users
 To send images, audio, video, or documents to users on a platform, you MUST use the \`platform_request\` tool with media fields (e.g., \`image_0_1\`, \`file_0_1\`). Provide a URL or workspace file path (e.g., \`data/images/photo.jpg\`) as the value — the file will be fetched and uploaded automatically.
 
 Do NOT use markdown image syntax (\`![]()\`) — external platforms do not render markdown. The only way to share a file is to attach it via \`platform_request\`.
@@ -170,7 +178,7 @@ When a user sends you a message, ALWAYS reply in the same chat. Use \`platform_r
 The \`chat\` field goes INSIDE the body. Do NOT create a daybook/post to reply to a message.
 
 ### Receiving files from users
-Users may attach files to their messages. These are automatically downloaded to your workspace and appear in the message as \`[Attached files: image: data/inbox/filename.jpg]\`. These are real files on disk you can use — move them to your data folders, reference them in responses, or process them as needed.`);
+Users may attach files to their messages. These are automatically downloaded to your workspace and appear in the message as \`[Attached files: image: data/inbox/filename.jpg]\`. These are real files on disk you can use — move them to your data folders, reference them in responses, or process them as needed.`}`);
 
   }
 

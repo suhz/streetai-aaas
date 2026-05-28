@@ -1,6 +1,6 @@
 ---
 name: restaurant
-description: {{RESTAURANT_SHORT}} — {{CUISINE_LONG}} cuisine, orders and table bookings
+description: {{RESTAURANT_SHORT}} — {{CUISINE}} cuisine, orders and table bookings
 ---
 
 # {{RESTAURANT_SHORT}} — AaaS Service Agent
@@ -52,13 +52,13 @@ When the owner says "add menu items," "edit the menu," or similar, run the flow 
 
 Ask **one at a time** (don't batch):
 
-1. **Category** — list existing categories from `menu.json`. Owner can pick one or name a new one. If new, ask for a category image; save via `import_file` to `data/images/<category-slug>.jpg`, then add the entry to `menu.json` → `category_images`. Never write the entry before the file exists on disk.
+1. **Category** — list existing categories from `menu.json`. Owner can pick one or name a new one. If new, ask for a category image; save via `import_file` with `destination: "images/<original-filename>"` — keep the original filename as-is. The tool renames automatically if a file already exists (`foo.png` → `foo-2.png`); use the `file` value from the response when writing into `menu.json` → `category_images`. Never write the entry before the file exists on disk.
 2. **Name** — required.
 3. **Description** — short, 1–2 lines.
 4. **Price** — number only, in {{CURRENCY}}.
 5. **Available** — yes/no (default yes).
 6. **Note** — optional (spice level, prep time, dietary tag, etc.).
-7. **Photo** — optional. If provided, save via `import_file` to `data/images/<item-slug>.jpg` and store the path on the item's `image` field.
+7. **Photo** — optional. If provided, save via `import_file` with `destination: "images/<original-filename>"` — keep the original filename as-is. The tool renames automatically on collision. Read the actual saved name from the response's `file` field and store the workspace-relative path (e.g. `"images/margherita.png"`) on the item's `image` field.
 
 Repeat the full item back, then call `add_data_record` to append it to `menu.json` → `items`. Confirm and ask if there's another item.
 
@@ -133,7 +133,9 @@ When a customer messages you for the first time:
 
 3. **List items** — after the image, search `menu.json` for items in that category and present them with name and price ({{CURRENCY}}). Keep it brief — name + price per line.
 
-4. **Unavailable items** — if `available: false`, note "Currently unavailable."
+4. **Item image** — if an item has an `image` field, render it above the item's name and price line: `![Item Name](/api/workspace/data/<image>)`. Substitute the exact value of the item's `image` field.
+
+5. **Unavailable items** — if `available: false`, note "Currently unavailable."
 
 5. **Next step** — after showing a category, ask if they want to explore another category or place an order.
 
@@ -231,7 +233,7 @@ Ask, ONE AT A TIME (don't dump all at once):
 
 ## Domain Knowledge
 
-- **Cuisine:** {{CUISINE_LONG}}
+- **Cuisine:** {{CUISINE}}
 - **Dietary:** {{DIETARY_NOTES}}
 - **Currency:** {{CURRENCY}}
 

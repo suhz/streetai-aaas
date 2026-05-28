@@ -48,14 +48,14 @@ When the owner says "add products," "edit the catalog," or similar, run the flow
 
 Ask **one at a time** (don't batch):
 
-1. **Category** — list existing categories from `products.json`. Owner can pick one or name a new one. If new, ask for a category image; save via `import_file` to `data/images/<category-slug>.jpg`, then add the entry to `products.json` → `category_images`. Never write the entry before the file exists on disk.
+1. **Category** — list existing categories from `products.json`. Owner can pick one or name a new one. If new, ask for a category image; save via `import_file` with `destination: "images/<original-filename>"` — keep the original filename as-is. The tool renames automatically if a file already exists (`foo.png` → `foo-2.png`); use the `file` value from the response when writing into `products.json` → `category_images`. Never write the entry before the file exists on disk.
 2. **Name** — required.
 3. **Description** — short, 1–2 lines.
 4. **Price** — number only, in {{CURRENCY}}.
 5. **Available** — yes/no (default yes).
 6. **Variant / options** — optional (sizes, colors). Skip if not applicable.
 7. **Note** — optional (material, care, warranty, etc.).
-8. **Photo** — optional. If provided, save via `import_file` to `data/images/<product-slug>.jpg` and store the path on the item's `image` field.
+8. **Photo** — optional. If provided, save via `import_file` with `destination: "images/<original-filename>"` — keep the original filename as-is. The tool renames automatically on collision. Read the actual saved name from the response's `file` field and store the workspace-relative path (e.g. `"images/red-mug.png"`) on the item's `image` field.
 
 Repeat the full product back, then call `add_data_record` to append it to `products.json` → `items`. Confirm and ask if there's another.
 
@@ -111,9 +111,10 @@ When a customer messages you for the first time:
 
 1. Read `products.json` (or use `search_data` for specific keywords or categories).
 2. If categories exist, list categories first → let customer pick one → show items in that category.
-3. If a category has an image in `products.json` → `category_images`, render it: `![Category](/api/workspace/data/PATH)`.
+3. **Category image is required when one exists.** When the customer picks a category, look up `products.json` → `category_images[CategoryName]`. If a path is set, you must render it before listing items: `![Category Name](/api/workspace/data/PATH)` — substitute PATH with the exact stored value. If no image is set, skip this step.
 4. For each item, show: name, price ({{CURRENCY}}), short description, availability.
-5. Skip items marked `available: false` or note "currently sold out — let me know if you want notified."
+5. **Item image:** if the item has an `image` field, render it above the item line: `![Item Name](/api/workspace/data/<image>)`. Substitute the exact value of the `image` field.
+6. Skip items marked `available: false` or note "currently sold out — let me know if you want notified."
 
 **Setup order for `category_images`:** never write an entry until the image file actually exists under `data/images/`. If a file is on disk but named differently, use `rename_data_file` to align it, then write the entry. Don't fabricate filenames.
 

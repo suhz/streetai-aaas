@@ -285,7 +285,7 @@ export default function Hub() {
                      onClick={() => {
                        setMenuOpen(null);
                        setEditName(ws.name);
-                       setEditDesc('');
+                       setEditDesc(ws.description || '');
                        setEditPhoto(null);
                        setEditPhotoPreview(ws.photo || null);
                        setEditPhotoRemoved(false);
@@ -313,6 +313,20 @@ export default function Hub() {
               )}
 
               <div className="card-body">
+                {ws.description && (
+                  <div style={{
+                    fontSize: 12,
+                    color: 'var(--text-muted)',
+                    lineHeight: 1.4,
+                    marginBottom: 10,
+                    overflow: 'hidden',
+                    display: '-webkit-box',
+                    WebkitLineClamp: 3,
+                    WebkitBoxOrient: 'vertical',
+                  }}>
+                    {ws.description}
+                  </div>
+                )}
                 <div className="deploy-detail">
                   <span>Directory</span>
                   <span className="mono">{ws.directory}/</span>
@@ -428,7 +442,7 @@ export default function Hub() {
                   This will <strong>permanently delete</strong> the agent workspace <strong>{deleting}/</strong> and all its data, skills, connections, and files. This cannot be undone.
                 </p>
                 <div className="form-group" style={{ marginTop: 12 }}>
-                  <label>Type <strong>{deleting}</strong> to confirm</label>
+                  <label>Type <strong style={{ textTransform: 'none' }}>{deleting}</strong> to confirm</label>
                   <input
                     type="text"
                     value={deleteConfirm}
