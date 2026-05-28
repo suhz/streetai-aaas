@@ -3,6 +3,23 @@ import path from 'path';
 import { readText, readJson, writeJson } from '../../utils/workspace.js';
 import { reconcileFromSkill, saveOwnerOverrides } from './transaction-view.js';
 
+// Extensions whose contents must never be inlined into tool results. Loading
+// the bytes as UTF-8 produces garbled mojibake AND can balloon the next LLM
+// call past the provider's context limit (e.g. a 2MB PNG ≈ 2M tokens).
+const BINARY_EXTENSIONS = new Set([
+  '.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.ico', '.tif', '.tiff', '.svg',
+  '.pdf',
+  '.mp3', '.wav', '.ogg', '.m4a', '.flac', '.aac',
+  '.mp4', '.mov', '.webm', '.avi', '.mkv',
+  '.zip', '.tar', '.gz', '.tgz', '.rar', '.7z',
+  '.bin', '.exe', '.dll', '.so', '.dylib',
+]);
+
+// Hard cap on inlined text reads. Above this, return a size-aware truncation
+// notice instead of the full content. 256KB ≈ ~64K tokens — enough room for
+// real data files, but a fraction of any provider's context window.
+const MAX_TEXT_READ_BYTES = 256 * 1024;
+
 /**
  * Read the current SKILL.md content.
  */
@@ -180,9 +197,44 @@ export function readDataFile(paths, { file }) {
     return JSON.stringify({ error: `File "${file}" not found in data/.`, available: listDataFiles(paths) });
   }
 
+  const ext = path.extname(safe).toLowerCase();
+
+  // Binary files: never inline contents. Return metadata + the workspace path
+  // the agent should use to reference the file (e.g. in markdown image links).
+  if (BINARY_EXTENSIONS.has(ext)) {
+    const stat = fs.statSync(fp);
+    return JSON.stringify({
+      file: safe,
+      type: 'binary',
+      extension: ext,
+      size: stat.size,
+      path: `data/${safe}`,
+      note: `Binary file — reference by path (e.g. ![label](/api/workspace/data/${safe})). Do not read its contents.`,
+    });
+  }
+
   if (safe.endsWith('.json')) {
     const data = readJson(fp);
     return JSON.stringify({ file: safe, data });
+  }
+
+  // Text files: cap size to keep tool results from blowing past the context
+  // window. If too large, return a truncated head + clear notice so the agent
+  // knows the content was partial.
+  const stat = fs.statSync(fp);
+  if (stat.size > MAX_TEXT_READ_BYTES) {
+    const fd = fs.openSync(fp, 'r');
+    const buf = Buffer.alloc(MAX_TEXT_READ_BYTES);
+    fs.readSync(fd, buf, 0, MAX_TEXT_READ_BYTES, 0);
+    fs.closeSync(fd);
+    return JSON.stringify({
+      file: safe,
+      truncated: true,
+      size: stat.size,
+      returned_bytes: MAX_TEXT_READ_BYTES,
+      content: buf.toString('utf-8'),
+      note: `File is ${stat.size} bytes; only the first ${MAX_TEXT_READ_BYTES} bytes were returned. Use search_data or run_query for targeted lookups.`,
+    });
   }
 
   const content = readText(fp);

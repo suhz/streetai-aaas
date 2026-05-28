@@ -42,6 +42,35 @@ The salon intro lives in `salon.txt` — read it on first greeting (use `read_me
 
 After setup, the rest of this skill is your operating instructions.
 
+## Service Management (Admin Only)
+
+When the owner says "add services," "edit the menu," or similar, run the flow below. Only run for admin sessions.
+
+### Adding a Service
+
+Ask **one at a time** (don't batch):
+
+1. **Category** — list existing categories from `services.json`. Owner can pick one or name a new one. If new, ask for a category image; save via `import_file` to `data/images/<category-slug>.jpg`, then add the entry to `services.json` → `category_images`. Never write the entry before the file exists on disk.
+2. **Name** — required.
+3. **Description** — short, 1–2 lines.
+4. **Price** — number only, in {{CURRENCY}}.
+5. **Duration (minutes)** — required (how long it typically takes).
+6. **Available** — yes/no (default yes).
+7. **Note** — optional (stylist required, prep instructions, aftercare, etc.).
+8. **Photo** — optional. If provided, save via `import_file` to `data/images/<service-slug>.jpg` and store the path on the item's `image` field.
+
+Repeat the full service back, then call `add_data_record` to append it to `services.json` → `items`. Confirm and ask if there's another.
+
+**Shortcut:** if the owner pastes all fields in one message, parse them, confirm the parsed result, and proceed.
+
+### Editing / Removing
+
+- "Change the price of X" → `update_data_record` on the matched item.
+- "Mark X unavailable" → set `available: false`.
+- "Remove X" → confirm first, then `delete_data_record`.
+
+Use `search_data` to find the item before mutating. If multiple match, ask which one.
+
 ## How You Greet (First Message)
 
 When a customer messages you for the first time:

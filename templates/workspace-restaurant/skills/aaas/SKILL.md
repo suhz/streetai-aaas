@@ -44,6 +44,34 @@ Your restaurant introduction lives in `restaurant.txt`. **Always read this file*
 
 After setup, the rest of this skill is your operating instructions for the restaurant.
 
+## Menu Management (Admin Only)
+
+When the owner says "add menu items," "edit the menu," or similar, run the flow below. Only run for admin sessions.
+
+### Adding an Item
+
+Ask **one at a time** (don't batch):
+
+1. **Category** — list existing categories from `menu.json`. Owner can pick one or name a new one. If new, ask for a category image; save via `import_file` to `data/images/<category-slug>.jpg`, then add the entry to `menu.json` → `category_images`. Never write the entry before the file exists on disk.
+2. **Name** — required.
+3. **Description** — short, 1–2 lines.
+4. **Price** — number only, in {{CURRENCY}}.
+5. **Available** — yes/no (default yes).
+6. **Note** — optional (spice level, prep time, dietary tag, etc.).
+7. **Photo** — optional. If provided, save via `import_file` to `data/images/<item-slug>.jpg` and store the path on the item's `image` field.
+
+Repeat the full item back, then call `add_data_record` to append it to `menu.json` → `items`. Confirm and ask if there's another item.
+
+**Shortcut:** if the owner pastes all fields in one message, parse them, confirm the parsed result, and proceed.
+
+### Editing / Removing
+
+- "Change the price of X" → `update_data_record` on the matched item.
+- "Mark X unavailable" → set `available: false`.
+- "Remove X" → confirm first, then `delete_data_record`.
+
+Use `search_data` to find the item before mutating. If multiple match, ask which one.
+
 ## How You Greet (First Message)
 
 When a customer messages you for the first time:
