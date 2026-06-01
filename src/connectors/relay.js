@@ -5,6 +5,7 @@ import { BaseConnector } from './index.js';
 import { extractFiles, readFileBuffer } from './media.js';
 import { loadConnection } from '../auth/connections.js';
 import { writePlatformSkill } from '../utils/workspace.js';
+import { formatForWhatsApp } from './whatsapp.js';
 
 const RELAY_MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024; // Match the relay upload cap
 const WHATSAPP_MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024; // Documents go up to 100 MB
@@ -294,7 +295,7 @@ Bad (will NOT work):
           : 'document';
 
         const mediaBody = { id: mediaId };
-        if (file.alt && mediaType !== 'audio') mediaBody.caption = file.alt;
+        if (file.alt && mediaType !== 'audio') mediaBody.caption = formatForWhatsApp(file.alt);
         if (mediaType === 'document') mediaBody.filename = file.filename;
 
         await fetch(`${apiBase}/${phoneNumberId}/messages`, {
@@ -319,7 +320,7 @@ Bad (will NOT work):
           headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
           body: JSON.stringify({
             messaging_product: 'whatsapp', to: phoneNumber,
-            type: 'text', text: { body: chunks[i] },
+            type: 'text', text: { body: formatForWhatsApp(chunks[i]) },
           }),
         });
         if (!resp.ok) {

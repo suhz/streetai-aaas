@@ -12,6 +12,10 @@ calicut_paragon_restaurant_llc/
 local-aaas/
 kpub/
 centro_restaurant/
+centro_salon/
+centro_reset/
+vibe_fitness_club/
+street_ai/
 
 # Dev files
 dashboard/src/
@@ -26,6 +30,7 @@ docs/
 examples/
 AaaS.txt
 CONTEXT.md
+TELNYX_VOICE_PLAN.md
 log.txt
 
 # Git

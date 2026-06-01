@@ -5,7 +5,9 @@ import { createServer } from 'http';
 import { BaseConnector } from './index.js';
 import { readFileBuffer } from './media.js';
 import { writePlatformSkill } from '../utils/workspace.js';
+import { loadConnection } from '../auth/connections.js';
 
+const WHATSAPP_API_BASE = 'https://graph.facebook.com/v21.0';
 const WHATSAPP_MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024; // Documents go up to 100 MB
 
 const WHATSAPP_SKILL = `---
@@ -70,7 +72,7 @@ export default class WhatsAppConnector extends BaseConnector {
     this.phoneNumberId = config.phoneNumberId;
     this.verifyToken = config.verifyToken;
     this.port = config.port || 3301;
-    this.apiBase = 'https://graph.facebook.com/v21.0';
+    this.apiBase = WHATSAPP_API_BASE;
     this.server = null;
     this.businessName = null;
   }
@@ -298,7 +300,7 @@ export default class WhatsAppConnector extends BaseConnector {
             : 'document';
 
           const mediaBody = { id: mediaId };
-          if (file.alt && mediaType !== 'audio') mediaBody.caption = file.alt;
+          if (file.alt && mediaType !== 'audio') mediaBody.caption = formatForWhatsApp(file.alt);
           if (mediaType === 'document') mediaBody.filename = file.filename;
 
           const sendResp = await fetch(
@@ -331,6 +333,7 @@ export default class WhatsAppConnector extends BaseConnector {
     if (response) {
       const chunks = this._splitMessage(response, 4096);
       for (const chunk of chunks) {
+        const formatted = formatForWhatsApp(chunk);
         for (let attempt = 1; attempt <= 3; attempt++) {
           try {
             const resp = await fetch(
@@ -345,7 +348,7 @@ export default class WhatsAppConnector extends BaseConnector {
                   messaging_product: 'whatsapp',
                   to: phoneNumber,
                   type: 'text',
-                  text: { body: chunk },
+                  text: { body: formatted },
                 }),
               }
             );
@@ -405,7 +408,7 @@ export default class WhatsAppConnector extends BaseConnector {
             messaging_product: 'whatsapp',
             to: phoneNumber,
             type: 'text',
-            text: { body: chunk },
+            text: { body: formatForWhatsApp(chunk) },
           }),
         });
       } catch (err) {
@@ -553,19 +556,189 @@ export default class WhatsAppConnector extends BaseConnector {
   }
 
   _splitMessage(text, maxLen) {
-    if (text.length <= maxLen) return [text];
-    const chunks = [];
-    let remaining = text;
-    while (remaining.length > 0) {
-      if (remaining.length <= maxLen) {
-        chunks.push(remaining);
-        break;
-      }
-      let splitAt = remaining.lastIndexOf('\n', maxLen);
-      if (splitAt < maxLen * 0.3) splitAt = maxLen;
-      chunks.push(remaining.slice(0, splitAt));
-      remaining = remaining.slice(splitAt).trimStart();
-    }
-    return chunks;
+    return splitWhatsAppText(text, maxLen);
   }
+}
+
+/**
+ * Split text into chunks no longer than maxLen, preferring to break on a
+ * newline when one falls in a sensible position. Module-level so both the
+ * connector instance and the static sendDirect/postWhatsAppText path share it.
+ */
+function splitWhatsAppText(text, maxLen) {
+  if (text.length <= maxLen) return [text];
+  const chunks = [];
+  let remaining = text;
+  while (remaining.length > 0) {
+    if (remaining.length <= maxLen) {
+      chunks.push(remaining);
+      break;
+    }
+    let splitAt = remaining.lastIndexOf('\n', maxLen);
+    if (splitAt < maxLen * 0.3) splitAt = maxLen;
+    chunks.push(remaining.slice(0, splitAt));
+    remaining = remaining.slice(splitAt).trimStart();
+  }
+  return chunks;
+}
+
+/**
+ * Send plain text to a WhatsApp number via the Graph API with the same
+ * markdown -> WhatsApp formatting, 4096-char chunking, and 3x retry the live
+ * connector's send() path uses. Static so it works from the dashboard process
+ * (no live connector instance needed). Returns { ok, message_id } on success
+ * or { ok:false, error } on failure.
+ */
+async function postWhatsAppText({ accessToken, phoneNumberId, apiBase = WHATSAPP_API_BASE }, to, text) {
+  const chunks = splitWhatsAppText(text, 4096);
+  let lastMessageId;
+  for (const chunk of chunks) {
+    const body = formatForWhatsApp(chunk);
+    let sent = false;
+    let lastError = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const resp = await fetch(`${apiBase}/${phoneNumberId}/messages`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            messaging_product: 'whatsapp',
+            to,
+            type: 'text',
+            text: { body },
+          }),
+        });
+        const json = await resp.json().catch(() => ({}));
+        if (resp.ok) {
+          lastMessageId = json.messages?.[0]?.id || lastMessageId;
+          sent = true;
+          break;
+        }
+        lastError = json.error?.message || `HTTP ${resp.status}`;
+      } catch (err) {
+        lastError = err.message;
+      }
+      if (attempt < 3) await new Promise((r) => setTimeout(r, 2000));
+    }
+    if (!sent) return { ok: false, error: lastError || 'Failed to send WhatsApp message.' };
+  }
+  return { ok: true, message_id: lastMessageId };
+}
+
+/**
+ * Static "send arbitrary text to a WhatsApp customer" helper, mirroring the
+ * Telegram connector's sendDirect export. Used by the dashboard's admin-
+ * intervention path (sendDirectToCustomer) to deliver an admin-authored
+ * message directly to the customer without a live connector instance. Reads
+ * the access token + phone number id from the workspace connection config.
+ *
+ * Note: WhatsApp only allows free-form messages within 24h of the customer's
+ * last inbound message; outside that window Meta requires an approved template
+ * and this will surface the API's error.
+ */
+export async function sendDirect(workspace, recipient, text) {
+  const conn = loadConnection(workspace, 'whatsapp');
+  if (!conn?.accessToken || !conn?.phoneNumberId) {
+    return { ok: false, error: 'WhatsApp is not connected for this workspace.' };
+  }
+  if (!recipient || !String(recipient).trim()) {
+    return { ok: false, error: 'recipient phone number is required.' };
+  }
+  if (!text || !String(text).trim()) {
+    return { ok: false, error: 'text is required.' };
+  }
+  return postWhatsAppText(
+    { accessToken: conn.accessToken, phoneNumberId: conn.phoneNumberId, apiBase: conn.apiBase },
+    String(recipient),
+    String(text),
+  );
+}
+
+/**
+ * Translate agent-emitted GitHub-flavored markdown into the inline syntax
+ * WhatsApp clients understand: `*bold*`, `_italic_`, `~strike~`, and monospace
+ * via triple backticks. Everything else markdown (`**bold**`, `***x***`,
+ * `[text](url)`, `# headings`, `> quotes`, `---`, tables, single-backtick
+ * inline code) just shows up as literal characters in the WhatsApp client, so
+ * this pass rewrites or strips it.
+ *
+ * Bold and italic are resolved through sentinels rather than in one regex pass:
+ * GitHub uses `**`/`__` for bold and `*`/`_` for italic, but WhatsApp uses a
+ * single `*` for bold. Converting `**x**` → `*x*` directly makes a later
+ * single-asterisk italic pass ambiguous (can't tell converted-bold from
+ * original-italic). So we map bold and italic to control-char sentinels first, then
+ * restore both at the end. Fenced code blocks are protected up front so their
+ * contents are never touched.
+ */
+export function formatForWhatsApp(text) {
+  if (!text) return text;
+
+  const BOLD = String.fromCharCode(1);
+  const ITALIC = String.fromCharCode(2);
+  const CODE = String.fromCharCode(0);
+  const codeBlocks = [];
+
+  let out = text;
+
+  // 1. Protect fenced code blocks (```...```) — WhatsApp keeps triple-backtick
+  //    monospace, so stash them and restore verbatim at the end.
+  out = out.replace(/```[\s\S]*?```/g, (m) => {
+    codeBlocks.push(m);
+    return `${CODE}${codeBlocks.length - 1}${CODE}`;
+  });
+
+  // 2. Inline code `x` — WhatsApp has no single-backtick inline mono, so the
+  //    backticks would show literally. Drop them, keep the text.
+  out = out.replace(/`([^`\n]+)`/g, '$1');
+
+  // 3. Markdown tables → readable lines (WhatsApp can't render tables).
+  //    Drop separator rows first, then flatten "| a | b |" → "a — b".
+  out = out
+    .replace(/^[ \t]*\|?[ \t:|-]*-{2,}[ \t:|-]*\|?[ \t]*$/gm, '')
+    .replace(/^[ \t]*\|(.+?)\|?[ \t]*$/gm, (_, row) =>
+      row.split('|').map((c) => c.trim()).filter(Boolean).join(' — '));
+
+  // 4. Images / links.
+  out = out
+    .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '$1')        // ![alt](url) → alt
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1 ($2)');   // [text](url) → text (url)
+
+  // 5. Bold (incl. bold-italic) → sentinel. Allow inner single `*` via [^\n].
+  out = out
+    .replace(/\*\*\*([^\n]+?)\*\*\*/g, `${BOLD}$1${BOLD}`) // ***x*** → bold
+    .replace(/\*\*([^\n]+?)\*\*/g, `${BOLD}$1${BOLD}`)     // **x**
+    .replace(/___([^\n]+?)___/g, `${BOLD}$1${BOLD}`)
+    .replace(/__([^\n]+?)__/g, `${BOLD}$1${BOLD}`);        // __x__
+
+  // 6. Remaining single * / _ → italic sentinel. Guard against word-internal
+  //    underscores (snake_case) and arithmetic (2*3) via boundary checks.
+  out = out
+    .replace(/(^|[^\w*])\*(?!\s)([^*\n]+?)\*(?!\w)/g, `$1${ITALIC}$2${ITALIC}`)
+    .replace(/(^|[^\w_])_(?!\s)([^_\n]+?)_(?!\w)/g, `$1${ITALIC}$2${ITALIC}`);
+
+  // 7. Strikethrough.
+  out = out.replace(/~~([^\n]+?)~~/g, '~$1~');           // ~~x~~ → ~x~
+
+  // 8. Headings → bold line.
+  out = out.replace(/^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$/gm, `${BOLD}$1${BOLD}`);
+
+  // 9. Blockquotes → plain text.
+  out = out.replace(/^\s*>\s?/gm, '');
+
+  // 10. Horizontal rules (---, ***, ___ on their own line) → drop.
+  out = out.replace(/^\s*([-*_])\1{2,}\s*$/gm, '');
+
+  // 11. Bullets → • (after bold/HR so we don't eat ** or ---).
+  out = out.replace(/^(\s*)[*\-+]\s+/gm, '$1• ');
+
+  // Restore sentinels to WhatsApp syntax, then code blocks.
+  out = out
+    .replace(new RegExp(BOLD, 'g'), '*')
+    .replace(new RegExp(ITALIC, 'g'), '_')
+    .replace(new RegExp(CODE + '(\\d+)' + CODE, 'g'), (_, i) => codeBlocks[Number(i)]);
+
+  return out;
 }

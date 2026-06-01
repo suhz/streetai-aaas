@@ -4,7 +4,9 @@ import { WebSocket } from 'ws';
 import { BaseConnector } from './index.js';
 import { readFileBuffer } from './media.js';
 import { writePlatformSkill } from '../utils/workspace.js';
+import { loadConnection } from '../auth/connections.js';
 
+const DISCORD_API_BASE = 'https://discord.com/api/v10';
 const DISCORD_MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024; // Discord caps user uploads at 25 MB by default; cap higher for boosted servers
 
 const DISCORD_SKILL = `---
@@ -52,7 +54,7 @@ export default class DiscordConnector extends BaseConnector {
   constructor(config, engine) {
     super(config, engine);
     this.token = config.botToken;
-    this.apiBase = 'https://discord.com/api/v10';
+    this.apiBase = DISCORD_API_BASE;
     this.ws = null;
     this.heartbeatInterval = null;
     this.lastSequence = null;
@@ -461,19 +463,104 @@ export default class DiscordConnector extends BaseConnector {
   }
 
   _splitMessage(text, maxLen) {
-    if (text.length <= maxLen) return [text];
-    const chunks = [];
-    let remaining = text;
-    while (remaining.length > 0) {
-      if (remaining.length <= maxLen) {
-        chunks.push(remaining);
-        break;
-      }
-      let splitAt = remaining.lastIndexOf('\n', maxLen);
-      if (splitAt < maxLen * 0.3) splitAt = maxLen;
-      chunks.push(remaining.slice(0, splitAt));
-      remaining = remaining.slice(splitAt).trimStart();
-    }
-    return chunks;
+    return splitDiscordText(text, maxLen);
   }
+}
+
+/**
+ * Split text into chunks no longer than maxLen (Discord's limit is 2000),
+ * preferring to break on a newline. Module-level so the connector instance
+ * and the static sendDirect path share it.
+ */
+function splitDiscordText(text, maxLen) {
+  if (text.length <= maxLen) return [text];
+  const chunks = [];
+  let remaining = text;
+  while (remaining.length > 0) {
+    if (remaining.length <= maxLen) {
+      chunks.push(remaining);
+      break;
+    }
+    let splitAt = remaining.lastIndexOf('\n', maxLen);
+    if (splitAt < maxLen * 0.3) splitAt = maxLen;
+    chunks.push(remaining.slice(0, splitAt));
+    remaining = remaining.slice(splitAt).trimStart();
+  }
+  return chunks;
+}
+
+/**
+ * Send plain text to a Discord user by opening (or reusing) a DM channel and
+ * posting there, with 2000-char chunking and 3x retry like the live send()
+ * path. Discord renders markdown natively, so no formatting conversion is
+ * applied. Static so it works from the dashboard process. Returns
+ * { ok, message_id } / { ok:false, error }.
+ */
+async function postDiscordDM({ token, apiBase = DISCORD_API_BASE }, userId, text) {
+  // 1. Open a DM channel with the user.
+  let channelId;
+  try {
+    const resp = await fetch(`${apiBase}/users/@me/channels`, {
+      method: 'POST',
+      headers: { Authorization: `Bot ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ recipient_id: userId }),
+    });
+    const json = await resp.json().catch(() => ({}));
+    if (!resp.ok || !json.id) {
+      return { ok: false, error: json.message || `Could not open DM channel (HTTP ${resp.status})` };
+    }
+    channelId = json.id;
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+
+  // 2. Send the message in 2000-char chunks with retry.
+  const chunks = splitDiscordText(text, 2000);
+  let lastMessageId;
+  for (const chunk of chunks) {
+    let sent = false;
+    let lastError = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const resp = await fetch(`${apiBase}/channels/${channelId}/messages`, {
+          method: 'POST',
+          headers: { Authorization: `Bot ${token}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content: chunk }),
+        });
+        const json = await resp.json().catch(() => ({}));
+        if (resp.ok) {
+          lastMessageId = json.id || lastMessageId;
+          sent = true;
+          break;
+        }
+        lastError = json.message || `HTTP ${resp.status}`;
+      } catch (err) {
+        lastError = err.message;
+      }
+      if (attempt < 3) await new Promise((r) => setTimeout(r, 2000));
+    }
+    if (!sent) return { ok: false, error: lastError || 'Failed to send Discord message.' };
+  }
+  return { ok: true, message_id: lastMessageId };
+}
+
+/**
+ * Static "send arbitrary text to a Discord customer" helper, mirroring the
+ * Telegram/WhatsApp sendDirect exports. Used by the dashboard's admin-
+ * intervention path (sendDirectToCustomer). The recipient is the customer's
+ * Discord user id (how Discord sessions are keyed); the message is delivered
+ * as a direct message. Reads the bot token from the workspace connection.
+ */
+export async function sendDirect(workspace, recipient, text) {
+  const conn = loadConnection(workspace, 'discord');
+  if (!conn?.botToken) {
+    return { ok: false, error: 'Discord is not connected for this workspace.' };
+  }
+  if (!recipient || !String(recipient).trim()) {
+    return { ok: false, error: 'recipient user id is required.' };
+  }
+  if (!text || !String(text).trim()) {
+    return { ok: false, error: 'text is required.' };
+  }
+  return postDiscordDM({ token: conn.botToken, apiBase: conn.apiBase }, String(recipient), String(text));
 }

@@ -4,7 +4,9 @@ import { WebSocket } from 'ws';
 import { BaseConnector } from './index.js';
 import { readFileBuffer } from './media.js';
 import { writePlatformSkill } from '../utils/workspace.js';
+import { loadConnection } from '../auth/connections.js';
 
+const SLACK_API_BASE = 'https://slack.com/api';
 const SLACK_MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024; // Conservative cap (Slack allows up to 1 GB)
 
 const SLACK_SKILL = `---
@@ -59,7 +61,7 @@ export default class SlackConnector extends BaseConnector {
     super(config, engine);
     this.botToken = config.botToken;
     this.appToken = config.appToken;
-    this.apiBase = 'https://slack.com/api';
+    this.apiBase = SLACK_API_BASE;
     this.ws = null;
     this.botUserId = null;
     this.botInfo = null;
@@ -306,7 +308,7 @@ export default class SlackConnector extends BaseConnector {
       for (const chunk of chunks) {
         const body = {
           channel: channelId,
-          text: chunk,
+          text: formatForSlack(chunk),
         };
         if (threadTs) body.thread_ts = threadTs;
 
@@ -443,19 +445,181 @@ export default class SlackConnector extends BaseConnector {
   }
 
   _splitMessage(text, maxLen) {
-    if (text.length <= maxLen) return [text];
-    const chunks = [];
-    let remaining = text;
-    while (remaining.length > 0) {
-      if (remaining.length <= maxLen) {
-        chunks.push(remaining);
-        break;
-      }
-      let splitAt = remaining.lastIndexOf('\n', maxLen);
-      if (splitAt < maxLen * 0.3) splitAt = maxLen;
-      chunks.push(remaining.slice(0, splitAt));
-      remaining = remaining.slice(splitAt).trimStart();
-    }
-    return chunks;
+    return splitSlackText(text, maxLen);
   }
+}
+
+/**
+ * Split text into chunks no longer than maxLen, preferring to break on a
+ * newline. Module-level so the connector instance and the static sendDirect
+ * path share it.
+ */
+function splitSlackText(text, maxLen) {
+  if (text.length <= maxLen) return [text];
+  const chunks = [];
+  let remaining = text;
+  while (remaining.length > 0) {
+    if (remaining.length <= maxLen) {
+      chunks.push(remaining);
+      break;
+    }
+    let splitAt = remaining.lastIndexOf('\n', maxLen);
+    if (splitAt < maxLen * 0.3) splitAt = maxLen;
+    chunks.push(remaining.slice(0, splitAt));
+    remaining = remaining.slice(splitAt).trimStart();
+  }
+  return chunks;
+}
+
+/**
+ * Send plain text to a Slack user by opening a DM (conversations.open) and
+ * posting there, applying the same mrkdwn formatting, chunking, and 3x retry
+ * the live send() path uses. Static so it works from the dashboard process.
+ *
+ * Slack returns HTTP 200 even on logical errors, so success is gated on the
+ * response body's `ok` field, not the HTTP status. Returns
+ * { ok, message_id } / { ok:false, error }.
+ */
+async function postSlackDM({ botToken, apiBase = SLACK_API_BASE }, userId, text) {
+  // 1. Open (or reuse) the DM channel with the user.
+  let channelId;
+  try {
+    const resp = await fetch(`${apiBase}/conversations.open`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${botToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ users: userId }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!data.ok || !data.channel?.id) {
+      return { ok: false, error: data.error || `Could not open DM (HTTP ${resp.status})` };
+    }
+    channelId = data.channel.id;
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+
+  // 2. Post the message in chunks with retry.
+  const chunks = splitSlackText(text, 3500);
+  let lastTs;
+  for (const chunk of chunks) {
+    let sent = false;
+    let lastError = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const resp = await fetch(`${apiBase}/chat.postMessage`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${botToken}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ channel: channelId, text: formatForSlack(chunk) }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (data.ok) {
+          lastTs = data.ts || lastTs;
+          sent = true;
+          break;
+        }
+        lastError = data.error || `HTTP ${resp.status}`;
+      } catch (err) {
+        lastError = err.message;
+      }
+      if (attempt < 3) await new Promise((r) => setTimeout(r, 2000));
+    }
+    if (!sent) return { ok: false, error: lastError || 'Failed to send Slack message.' };
+  }
+  return { ok: true, message_id: lastTs };
+}
+
+/**
+ * Static "send arbitrary text to a Slack customer" helper, mirroring the
+ * Telegram/WhatsApp/Discord sendDirect exports. Used by the dashboard's admin-
+ * intervention path (sendDirectToCustomer). The recipient is the customer's
+ * Slack user id (how Slack sessions are keyed); the message is delivered as a
+ * direct message. Reads the bot token from the workspace connection config.
+ */
+export async function sendDirect(workspace, recipient, text) {
+  const conn = loadConnection(workspace, 'slack');
+  if (!conn?.botToken) {
+    return { ok: false, error: 'Slack is not connected for this workspace.' };
+  }
+  if (!recipient || !String(recipient).trim()) {
+    return { ok: false, error: 'recipient user id is required.' };
+  }
+  if (!text || !String(text).trim()) {
+    return { ok: false, error: 'text is required.' };
+  }
+  return postSlackDM({ botToken: conn.botToken, apiBase: conn.apiBase }, String(recipient), String(text));
+}
+
+/**
+ * Translate agent-emitted GitHub-flavored markdown into Slack's mrkdwn.
+ * Slack uses `*bold*` (single asterisk), `_italic_`, `~strike~`, single- and
+ * triple-backtick code, `<url|text>` links, and native `>` blockquotes — but
+ * has NO heading syntax, NO `[text](url)` markdown links, and renders
+ * `**bold**` / `***x***` / tables / `#` headings as literal characters. This
+ * pass rewrites or strips the unsupported markdown.
+ *
+ * Mirrors the WhatsApp formatter, with three Slack-specific differences:
+ * inline code is kept (Slack renders it), links become `<url|text>`, and
+ * blockquotes are left intact. Bold and italic are resolved through control-
+ * char sentinels (convert bold first, then italic, then restore) to avoid the
+ * single-asterisk ambiguity. Code spans are stashed up front so their contents
+ * are never touched.
+ */
+function formatForSlack(text) {
+  if (!text) return text;
+
+  const BOLD = String.fromCharCode(1);
+  const ITALIC = String.fromCharCode(2);
+  const CODE = String.fromCharCode(0);
+  const codeSpans = [];
+  const stash = (m) => { codeSpans.push(m); return CODE + (codeSpans.length - 1) + CODE; };
+
+  let out = text;
+
+  // 1. Protect fenced AND inline code — Slack renders both, so keep verbatim.
+  out = out.replace(/```[\s\S]*?```/g, stash);
+  out = out.replace(/`[^`\n]+`/g, stash);
+
+  // 2. Markdown tables → readable lines (Slack has no tables).
+  out = out
+    .replace(/^[ \t]*\|?[ \t:|-]*-{2,}[ \t:|-]*\|?[ \t]*$/gm, '')
+    .replace(/^[ \t]*\|(.+?)\|?[ \t]*$/gm, (_, row) =>
+      row.split('|').map((c) => c.trim()).filter(Boolean).join(' — '));
+
+  // 3. Images / links → Slack syntax.
+  out = out
+    .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '$1')          // ![alt](url) → alt
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<$2|$1>');     // [text](url) → <url|text>
+
+  // 4. Bold (incl. bold-italic) → sentinel. Allow inner single `*` via [^\n].
+  out = out
+    .replace(/\*\*\*([^\n]+?)\*\*\*/g, BOLD + '$1' + BOLD) // ***x*** → bold
+    .replace(/\*\*([^\n]+?)\*\*/g, BOLD + '$1' + BOLD)     // **x**
+    .replace(/___([^\n]+?)___/g, BOLD + '$1' + BOLD)
+    .replace(/__([^\n]+?)__/g, BOLD + '$1' + BOLD);        // __x__
+
+  // 5. Remaining single * / _ → italic sentinel. Guard snake_case / arithmetic.
+  out = out
+    .replace(/(^|[^\w*])\*(?!\s)([^*\n]+?)\*(?!\w)/g, '$1' + ITALIC + '$2' + ITALIC)
+    .replace(/(^|[^\w_])_(?!\s)([^_\n]+?)_(?!\w)/g, '$1' + ITALIC + '$2' + ITALIC);
+
+  // 6. Strikethrough.
+  out = out.replace(/~~([^\n]+?)~~/g, '~$1~');             // ~~x~~ → ~x~
+
+  // 7. Headings → bold line (Slack has no headings).
+  out = out.replace(/^[ \t]{0,3}#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$/gm, BOLD + '$1' + BOLD);
+
+  // 8. Horizontal rules (---, ***, ___ on their own line) → drop.
+  out = out.replace(/^[ \t]*([-*_])\1{2,}[ \t]*$/gm, '');
+
+  // 9. Bullets → • (Slack doesn't reliably render markdown bullets).
+  //    Blockquotes (> ) are intentionally left intact — Slack renders them.
+  out = out.replace(/^([ \t]*)[*\-+][ \t]+/gm, '$1• ');
+
+  // Restore sentinels to mrkdwn syntax, then code spans.
+  out = out
+    .replace(new RegExp(BOLD, 'g'), '*')
+    .replace(new RegExp(ITALIC, 'g'), '_')
+    .replace(new RegExp(CODE + '(\\d+)' + CODE, 'g'), (_, i) => codeSpans[Number(i)]);
+
+  return out;
 }

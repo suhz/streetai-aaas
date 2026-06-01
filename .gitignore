@@ -15,6 +15,10 @@ calicut_paragon_restaurant_llc/
 local-aaas/
 kpub/
 centro_restaurant/
+centro_salon/
+centro_reset/
+vibe_fitness_club/
+street_ai/
 
 # Credentials and secrets
 .aaas/credentials.json
@@ -35,3 +39,4 @@ log.txt
 # Dev/temp files
 AaaS.txt
 CONTEXT.md
+TELNYX_VOICE_PLAN.md
