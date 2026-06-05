@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { BaseConnector, clearPausedSessionsForPlatform } from './index.js';
 import { readFileBuffer } from './media.js';
+import { buildInboundContent } from './inbound-media.js';
 import { writePlatformSkill } from '../utils/workspace.js';
 import { findAlertByChannelMessage, getRecentOpenAlerts } from '../notifications/alerts.js';
 import { loadConnection, saveConnection } from '../auth/connections.js';
@@ -168,12 +169,7 @@ export default class TelegramConnector extends BaseConnector {
           if (mediaItems.length > 0) {
             const safeUser = (msg.from.username || userName).replace(/[^a-zA-Z0-9._-]/g, '_');
             const savedFiles = await this._downloadMedia(mediaItems, safeUser);
-            if (savedFiles.length > 0) {
-              const fileList = savedFiles.map(f => `${f.type}: ${f.path}`).join(', ');
-              content = content
-                ? `${content}\n\n[Attached files: ${fileList}]`
-                : `[Attached files: ${fileList}]`;
-            }
+            content = await buildInboundContent(this.engine, content, savedFiles);
           }
 
           try {
@@ -319,7 +315,9 @@ export default class TelegramConnector extends BaseConnector {
     // Non-parse HTTP errors (bad chat_id, blocked, too long, etc.) bail
     // immediately — retrying the same payload won't help.
     if (response) {
-      const chunks = this._splitMessage(response, 4096);
+      // Telegram renders neither Markdown nor HTML tables — flatten any table
+      // to plain lines first so menus/lists don't arrive as a wall of pipes.
+      const chunks = this._splitMessage(flattenTables(response), 4096);
       for (const chunk of chunks) {
         await this._sendText(chatId, chunk);
       }
@@ -632,6 +630,20 @@ export async function sendDirect(workspace, chatId, text) {
  * unrecognized as escaped text. If Telegram still rejects the result, the
  * caller falls back to plain text.
  */
+/**
+ * Telegram supports no table syntax (Markdown or HTML). Convert a GitHub-style
+ * markdown table into plain lines: drop the separator row, join each row's cells
+ * with " — ". Lines that aren't tables are left untouched.
+ */
+function flattenTables(text) {
+  if (!text) return text;
+  return text
+    .replace(/^[ \t]*\|?[ \t:|-]*-{2,}[ \t:|-]*\|?[ \t]*$/gm, '')   // separator rows
+    .replace(/^[ \t]*\|(.+?)\|?[ \t]*$/gm, (_, row) =>
+      row.split('|').map((c) => c.trim()).filter(Boolean).join(' — '))
+    .replace(/\n{3,}/g, '\n\n');
+}
+
 function markdownToTelegramHtml(text) {
   if (!text) return text;
 

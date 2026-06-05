@@ -70,34 +70,56 @@ export default function Transactions() {
   const [searchParams, setSearchParams] = useSearchParams();
   const selected = searchParams.get('id');
 
-  // ── "New since last visit" highlight ──
+  // ── "New / changed since last visit" highlight ──
   // Snapshot the last-seen timestamp at mount, BEFORE the sidebar-badge effect
-  // advances it. Rows with `created_at > highlightSince` get a subtle accent
-  // until the user clicks into them or revisits the tab (next mount captures
-  // the updated lastSeen and the highlight clears).
+  // advances it. Rows get a subtle accent based on what changed:
+  //   • created after highlightSince  → 'new'       (pink, pulsing)
+  //   • updated after highlightSince  → 'updated'   (amber)
+  //   • updated + status cancelled    → 'cancelled' (red, pulsing)
+  // The highlight clears when the user opens the row or revisits the tab
+  // (next mount captures the advanced lastSeen).
   const [highlightSince] = useState(() => getLastSeen(workspace));
-  const [dismissedNew, setDismissedNew] = useState(() => new Set());
-  const dismissNewHighlight = (id) => {
+  // Per-row "seen up to" watermark: id -> the activity timestamp
+  // (max of created_at / updated_at) at the moment the row was opened. A row
+  // re-highlights only when it changes again past this point, so a later
+  // cancellation lights up even on a row that was opened earlier.
+  const [dismissed, setDismissed] = useState(() => new Map());
+  const activityOf = (t) => {
+    const c = t.created_at, u = t.updated_at;
+    if (c && u) return u > c ? u : c;
+    return u || c || null;
+  };
+  const dismissRow = (t) => {
+    const id = t.id || t._file;
     if (!id) return;
-    setDismissedNew(prev => {
-      if (prev.has(id)) return prev;
-      const next = new Set(prev);
-      next.add(id);
+    const ts = activityOf(t);
+    setDismissed(prev => {
+      if (prev.get(id) === ts) return prev;
+      const next = new Map(prev);
+      next.set(id, ts);
       return next;
     });
   };
-  const isNewRow = (t) => {
-    if (!highlightSince) return false;
+  // Returns 'new' | 'updated' | 'cancelled' | null for a row's highlight.
+  const rowState = (t) => {
+    if (!highlightSince) return null;
     const id = t.id || t._file;
-    if (dismissedNew.has(id)) return false;
-    return t.created_at && t.created_at > highlightSince;
+    const seen = dismissed.get(id);
+    const since = seen && seen > highlightSince ? seen : highlightSince;
+    if (t.created_at && t.created_at > since) return 'new';
+    if (t.updated_at && t.updated_at > since) {
+      return t.status === 'cancelled' ? 'cancelled' : 'updated';
+    }
+    return null;
   };
 
   const setSelected = (id) => {
-    if (id) {
-      dismissNewHighlight(id);
-      setSearchParams({ id });
-    } else setSearchParams({});
+    if (id) setSearchParams({ id });
+    else setSearchParams({});
+  };
+  const openTxn = (t) => {
+    dismissRow(t);
+    setSelected(t.id || t._file);
   };
 
   const [editorOpen, setEditorOpen] = useState(false);
@@ -161,12 +183,14 @@ export default function Transactions() {
 
   // Mark all currently-loaded transactions as seen for the sidebar badge.
   // Re-runs whenever the transaction list updates, so the badge stays at 0
-  // while the user is sitting on this page even as new txns arrive.
+  // while the user is sitting on this page even as new/changed txns arrive.
+  // Uses the activity timestamp (max of created_at / updated_at) so customer
+  // edits and cancellations clear the badge the same way new rows do.
   useEffect(() => {
     if (!allTxns) return;
     let latest = null;
     for (const t of allTxns) {
-      const ts = t.created_at;
+      const ts = activityOf(t);
       if (ts && (!latest || ts > latest)) latest = ts;
     }
     setLastSeen(workspace, latest || new Date().toISOString());
@@ -406,13 +430,17 @@ export default function Transactions() {
             <tbody>
               {pagedTxns.map((t, i) => {
                 const isArchived = t.archived === true;
-                const newHighlight = isNewRow(t);
+                const hlState = rowState(t);
+                const rowClass = hlState === 'new' ? 'txn-row-new'
+                  : hlState === 'updated' ? 'txn-row-updated'
+                  : hlState === 'cancelled' ? 'txn-row-cancelled'
+                  : undefined;
                 const seq = formatSeq(t);
                 return (
                 <tr
                   key={t.id || i}
-                  onClick={() => setSelected(t.id || t._file)}
-                  className={newHighlight ? 'txn-row-new' : undefined}
+                  onClick={() => openTxn(t)}
+                  className={rowClass}
                   style={{ cursor: 'pointer' }}
                 >
                   <td
@@ -421,12 +449,14 @@ export default function Transactions() {
                       fontVariantNumeric: 'tabular-nums',
                       fontSize: 13,
                       color: 'var(--text-muted)',
-                      width: newHighlight ? 96 : 56,
+                      width: hlState ? 124 : 56,
                       whiteSpace: 'nowrap',
                     }}
                   >
                     {seq}
-                    {newHighlight && <span className="txn-new-pill">NEW</span>}
+                    {hlState === 'new' && <span className="txn-new-pill">NEW</span>}
+                    {hlState === 'updated' && <span className="txn-updated-pill">UPDATED</span>}
+                    {hlState === 'cancelled' && <span className="txn-cancelled-pill">CANCELLED</span>}
                   </td>
                   <td>
                     <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
@@ -867,7 +897,7 @@ function TransactionDetail({ id, onBack, currency: fallbackCurrency, viewConfig,
         Object.values path would render each character as a cell — guarding by
         shape avoids that and accepts any reasonable agent output. */}
       {data.items && Array.isArray(data.items) && data.items.length > 0 && (
-        <ItemsCard items={data.items} viewConfig={viewConfig} />
+        <ItemsCard items={data.items} viewConfig={viewConfig} currency={currency} />
       )}
 
       {/* Sub-transactions */}
@@ -1008,7 +1038,15 @@ function StatusSelector({ status, allowed, onChange }) {
   );
 }
 
-function ItemsCard({ items, viewConfig }) {
+// Item columns that hold money, so the Items table shows e.g. "AED 24.00"
+// instead of a bare "24". Used as a fallback when the agent didn't declare a
+// field's type as `currency` in SKILL.md.
+const MONEY_ITEM_KEYS = new Set([
+  'price', 'cost', 'amount', 'total', 'subtotal', 'sub_total',
+  'unit_price', 'line_total', 'rate', 'fee',
+]);
+
+function ItemsCard({ items, viewConfig, currency }) {
   const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
   const allObjects = items.every(isObject);
 
@@ -1019,6 +1057,13 @@ function ItemsCard({ items, viewConfig }) {
     // attached are not silently dropped.
     const declared = Array.isArray(viewConfig?.item_fields) ? viewConfig.item_fields : [];
     const declaredKeys = declared.map(f => f.key);
+    // Map of key -> declared type (e.g. 'currency') for format decisions.
+    const typeByKey = {};
+    for (const f of declared) { if (f?.key && f.type) typeByKey[f.key] = f.type; }
+    // A column is money if declared `currency`, or (when undeclared) its name
+    // is a common price field. Quantities/names are left untouched.
+    const isMoneyKey = (k) =>
+      typeByKey[k] === 'currency' || (!typeByKey[k] && MONEY_ITEM_KEYS.has(k.toLowerCase()));
     const seen = new Set(declaredKeys);
     const extras = [];
     for (const item of items) {
@@ -1039,13 +1084,12 @@ function ItemsCard({ items, viewConfig }) {
               <tr key={i}>
                 {keys.map(k => {
                   const v = item[k];
-                  return (
-                    <td key={k}>
-                      {v == null
-                        ? '—'
-                        : (typeof v === 'object' ? JSON.stringify(v) : String(v))}
-                    </td>
-                  );
+                  let display;
+                  if (v == null) display = '—';
+                  else if (typeof v === 'object') display = JSON.stringify(v);
+                  else if (isMoneyKey(k) && Number.isFinite(Number(v))) display = formatCurrency(v, currency);
+                  else display = String(v);
+                  return <td key={k}>{display}</td>;
                 })}
               </tr>
             ))}

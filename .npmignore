@@ -16,6 +16,9 @@ centro_salon/
 centro_reset/
 vibe_fitness_club/
 street_ai/
+streetai-book/
+thalassery/
+prataps_the_dhaba/
 
 # Dev files
 dashboard/src/
@@ -31,6 +34,7 @@ examples/
 AaaS.txt
 CONTEXT.md
 TELNYX_VOICE_PLAN.md
+CLIENT_INSTALLER_PLAN.md
 log.txt
 
 # Git

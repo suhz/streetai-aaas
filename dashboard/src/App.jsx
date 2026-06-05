@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Routes, Route, NavLink, useParams, useNavigate, useLocation } from 'react-router-dom';
-import { WorkspaceContext } from './hooks/useApi.js';
+import { WorkspaceContext, useResolveUrl } from './hooks/useApi.js';
 import { ThemeContext, useThemeState } from './hooks/useTheme.js';
 import { NavModeContext, useNavModeStore, useNavMode } from './hooks/useNavMode.js';
 import Overview from './pages/Overview.jsx';
@@ -20,6 +20,9 @@ import GetStarted from './pages/GetStarted.jsx';
 import Guide from './pages/Guide.jsx';
 import SetupGuide from './pages/SetupGuide.jsx';
 import { useUnseenTransactions } from './hooks/useUnseenTransactions.js';
+import { useAgentHealth } from './hooks/useAgentHealth.js';
+import AgentDownAlert from './components/AgentDownAlert.jsx';
+import { isMuted, setMuted, playChime, SOUND_PREF_EVENT } from './utils/notificationSound.js';
 
 function Logo() {
   return (
@@ -118,17 +121,68 @@ function hubNav(hasAgents) {
   return [{ section: '', items }];
 }
 
-function Sidebar({ navItems, mode, onLogoClick, workspaceName }) {
+/** Turn a workspace slug into a display name: "centro_restaurant" -> "Centro Restaurant". */
+function prettifyName(slug) {
+  return (String(slug || '')
+    .replace(/[-_]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/\b\w/g, (c) => c.toUpperCase())) || 'Agent';
+}
+
+/** Agent brand: the workspace photo (falls back to the hub logo) + business name. */
+function WorkspaceBrand({ workspaceName, health }) {
+  const resolve = useResolveUrl();
+  const [imgOk, setImgOk] = useState(true);
+  const name = prettifyName(workspaceName);
+  return (
+    <div className="sidebar-logo">
+      {imgOk
+        ? <img className="sidebar-avatar" src={resolve('/api/avatar')} alt={name} onError={() => setImgOk(false)} />
+        : <Logo />}
+      <span className="sidebar-agent-name">{name}<AgentStatusDot health={health} /></span>
+    </div>
+  );
+}
+
+/**
+ * Agent health LED shown at the end of the agent name. Color carries the
+ * state (green live, amber reconnecting, red down, grey offline); the word is
+ * available on hover. Calm pulse when active.
+ */
+function AgentStatusDot({ health }) {
+  if (!health || health.state === 'unknown') return null;
+  const map = {
+    online: { color: 'var(--green)', label: 'online', pulse: true },
+    reconnecting: { color: 'var(--yellow)', label: 'reconnecting', pulse: true },
+    error: { color: 'var(--red)', label: 'stopped', pulse: true },
+    stopped: { color: 'var(--text-muted)', label: 'offline', pulse: false },
+  };
+  const s = map[health.state] || map.stopped;
+  return (
+    <span
+      className={`status-led status-led-inline ${s.pulse ? 'status-led-pulse' : ''}`}
+      style={{ color: s.color }}
+      title={`Agent ${s.label}`}
+    />
+  );
+}
+
+function Sidebar({ navItems, mode, onLogoClick, workspaceName, health }) {
   return (
     <aside className="sidebar">
       <div className="sidebar-brand" onClick={onLogoClick} style={{ cursor: 'pointer' }}>
-        <div className="sidebar-logo">
-          <Logo />
-          <span className="sidebar-logo-text">AaaS</span>
-        </div>
-        <div className="sidebar-tagline">
-          {workspaceName ? workspaceName : 'Agent as a Service'}
-        </div>
+        {workspaceName ? (
+          <WorkspaceBrand workspaceName={workspaceName} health={health} />
+        ) : (
+          <>
+            <div className="sidebar-logo">
+              <Logo />
+              <span className="sidebar-logo-text">AaaS<AgentStatusDot health={health} /></span>
+            </div>
+            <div className="sidebar-tagline">Agent as a Service</div>
+          </>
+        )}
       </div>
 
       {mode === 'hub' && workspaceName && (
@@ -174,11 +228,54 @@ function Sidebar({ navItems, mode, onLogoClick, workspaceName }) {
 
       <div style={{ flex: 1 }} />
       <div className="sidebar-footer">
-        <a href="https://github.com/Tem-Degu/streetai-aaas" target="_blank" rel="noreferrer">GitHub</a>
-        {' \u00b7 '}
-        <span>v0.1.0</span>
+        <SoundToggle />
+        <span className="sidebar-footer-meta">
+          <a href="https://github.com/Tem-Degu/streetai-aaas" target="_blank" rel="noreferrer">GitHub</a>
+          {' \u00b7 '}
+          <span>v0.1.0</span>
+        </span>
       </div>
     </aside>
+  );
+}
+
+/**
+ * Mute/unmute the new-transaction chime. Persists to localStorage via the
+ * notificationSound util; clicking unmute also unlocks the AudioContext and
+ * plays a confirmation ping so the operator hears it works.
+ */
+function SoundToggle() {
+  const [muted, setMutedState] = useState(() => isMuted());
+  useEffect(() => {
+    const onChange = (e) => setMutedState(!!e?.detail?.muted);
+    window.addEventListener(SOUND_PREF_EVENT, onChange);
+    return () => window.removeEventListener(SOUND_PREF_EVENT, onChange);
+  }, []);
+  const toggle = () => {
+    const next = !muted;
+    setMuted(next);
+    if (!next) playChime(); // confirm audio works on enable
+  };
+  return (
+    <button
+      onClick={toggle}
+      title={muted ? 'Transaction sound off \u2014 click to enable' : 'Transaction sound on \u2014 click to mute'}
+      aria-label={muted ? 'Enable transaction sound' : 'Mute transaction sound'}
+      style={{
+        display: 'inline-flex', alignItems: 'center', gap: 5,
+        background: 'none', border: 'none', cursor: 'pointer', padding: 0,
+        color: 'inherit', font: 'inherit',
+      }}
+    >
+      {muted ? (
+        // speaker-muted
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>
+      ) : (
+        // speaker-on
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>
+      )}
+      <span>Sound</span>
+    </button>
   );
 }
 
@@ -191,7 +288,7 @@ function WorkspaceView() {
 
   return (
     <WorkspaceContext.Provider value={wsName}>
-      <WorkspaceLayout navItems={navItems} wsName={wsName} prefix={prefix} />
+      <WorkspaceLayout navItems={navItems} wsName={wsName} prefix={prefix} navMode={navMode} />
     </WorkspaceContext.Provider>
   );
 }
@@ -207,18 +304,21 @@ function withTransactionsBadge(navItems, count, prefix) {
   }));
 }
 
-function WorkspaceLayout({ navItems, wsName, prefix }) {
+function WorkspaceLayout({ navItems, wsName, prefix, navMode }) {
   const navigate = useNavigate();
   const unseenTxns = useUnseenTransactions();
+  const health = useAgentHealth();
   const decoratedNav = withTransactionsBadge(navItems, unseenTxns, prefix);
 
   return (
     <div className="layout">
+      <AgentDownAlert health={health} basic={navMode === 'basic'} />
       <Sidebar
         navItems={decoratedNav}
         mode="hub"
         workspaceName={wsName}
         onLogoClick={() => navigate('/')}
+        health={health}
       />
       <main className="main">
         <Routes>
@@ -290,14 +390,17 @@ function StandaloneLayout() {
   const { navMode } = useNavMode(null);
   const navItems = navMode === 'basic' ? basicNav('') : workspaceNav('');
   const unseenTxns = useUnseenTransactions();
+  const health = useAgentHealth();
   const decoratedNav = withTransactionsBadge(navItems, unseenTxns, '');
 
   return (
     <div className="layout">
+      <AgentDownAlert health={health} basic={navMode === 'basic'} />
       <Sidebar
         navItems={decoratedNav}
         mode="workspace"
         onLogoClick={() => navigate('/')}
+        health={health}
       />
       <main className="main">
         <Routes>

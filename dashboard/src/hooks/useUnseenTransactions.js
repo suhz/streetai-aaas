@@ -1,6 +1,7 @@
 import { useState, useEffect, useContext, useRef } from 'react';
 import { WorkspaceContext } from './useApi.js';
 import { getLastSeen, setLastSeen, SEEN_EVENT } from '../utils/unseenTransactions.js';
+import { playChime, bindAudioUnlock } from '../utils/notificationSound.js';
 
 const POLL_MS = 15000;
 
@@ -27,11 +28,28 @@ export function useUnseenTransactions() {
   const workspace = useContext(WorkspaceContext);
   const [count, setCount] = useState(0);
   const initedRef = useRef(false);
+  // Last count we observed, to detect upward changes worth chiming for. Null
+  // until the first tick so we never chime on initial page load — only when
+  // the count rises while the dashboard is already open.
+  const prevCountRef = useRef(null);
 
   useEffect(() => {
     initedRef.current = false;
+    prevCountRef.current = null;
     let cancelled = false;
     let timerId = null;
+
+    // Lets later chimes play: the AudioContext unlocks on the user's first
+    // click/keypress anywhere in the dashboard.
+    bindAudioUnlock();
+
+    // Update the count and chime if it rose since the previous tick.
+    const apply = (newCount) => {
+      setCount(newCount);
+      const prev = prevCountRef.current;
+      if (prev !== null && newCount > prev) playChime();
+      prevCountRef.current = newCount;
+    };
 
     const tick = async () => {
       const since = getLastSeen(workspace);
@@ -50,8 +68,9 @@ export function useUnseenTransactions() {
           initedRef.current = true;
           setLastSeen(workspace, d.latestAt || new Date().toISOString());
           setCount(0);
+          prevCountRef.current = 0;
         } else {
-          setCount(d.count || 0);
+          apply(d.count || 0);
         }
       } catch {
         // network blip — leave previous count, next tick will recover
@@ -59,7 +78,10 @@ export function useUnseenTransactions() {
     };
 
     const onSeen = (e) => {
-      if (!e?.detail || e.detail.workspace === workspace) setCount(0);
+      if (!e?.detail || e.detail.workspace === workspace) {
+        setCount(0);
+        prevCountRef.current = 0;
+      }
     };
 
     tick();

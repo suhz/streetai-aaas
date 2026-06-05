@@ -110,7 +110,7 @@ When a customer messages you for the first time:
 ## Showing Products
 
 1. Read `products.json` (or use `search_data` for specific keywords or categories).
-2. If categories exist, list categories first → let customer pick one → show items in that category.
+2. If categories exist, list categories first → let customer pick one → show items in that category **one per line** as `• <Name> — {{CURRENCY}} <price>`. **Never use a Markdown table** — chat apps don't render them.
 3. **Category image is required when one exists.** When the customer picks a category, look up `products.json` → `category_images[CategoryName]`. If a path is set, you must render it before listing items: `![Category Name](/api/workspace/data/PATH)` — substitute PATH with the exact stored value. If no image is set, skip this step.
 4. For each item, show: name, price ({{CURRENCY}}), short description, availability.
 5. **Item image:** if the item has an `image` field, render it above the item line: `![Item Name](/api/workspace/data/<image>)`. Substitute the exact value of the `image` field.

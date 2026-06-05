@@ -28,6 +28,7 @@ import {
 } from './commands/hub.js';
 import { exportCommand } from './commands/export.js';
 import { importCommand } from './commands/import.js';
+import { publishCommand } from './commands/publish.js';
 
 const program = new Command();
 
@@ -386,5 +387,14 @@ program
   .argument('[target-dir]', 'Folder to restore into (default: workspace name from the bundle)')
   .option('--force', 'Allow overwriting an existing non-empty target folder')
   .action(importCommand);
+
+program
+  .command('publish [agent-name]')
+  .description('Export a workspace and upload it to StreetAI, returning a customer setup link')
+  .option('--business <name>', 'Business display name (used for the desktop shortcut)')
+  .option('--server <url>', 'StreetAI server (default https://streetai.org or $STREETAI_PUBLISH_URL)')
+  .option('--key <key>', 'Admin key (or set $STREETAI_PUBLISH_KEY)')
+  .option('--no-secrets', 'Strip credentials before uploading')
+  .action(publishCommand);
 
 program.parse();

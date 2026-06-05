@@ -17,6 +17,7 @@ import { loadConnection, saveConnection } from '../auth/connections.js';
 import crypto from 'crypto';
 
 const MAX_TOOL_ROUNDS = 10;
+const VOICE_MAX_TOOL_ROUNDS = 4; // tighter bound on phone calls — latency matters more than depth
 
 export class AgentEngine {
   /**
@@ -254,9 +255,9 @@ export class AgentEngine {
     // response so the connector doesn't auto-reply.
     //
     // Auto-resume safety net: a paused session whose `paused_at` is older
-    // than PAUSE_MAX_HOURS is treated as unpaused (clears the flag and
-    // proceeds normally). This protects against an admin forgetting to
-    // resume the agent for days.
+    // than pauseMaxHours (default 1h) is treated as unpaused (clears the flag
+    // and proceeds normally). This protects against an admin forgetting to
+    // resume the agent — a forgotten pause clears within an hour.
     //
     // The pause flag is NOT honored for events that came from the
     // dashboard itself (those are admin actions, not customer messages),
@@ -307,7 +308,7 @@ export class AgentEngine {
     // `mode` was resolved earlier (step 2b) — reused here for the base prompt.
     // `now` is sampled fresh per turn so the model's authoritative clock
     // doesn't drift across long-lived engine instances.
-    this.basePrompt = buildBasePrompt(this.paths, { mode, now: new Date(), platform });
+    this.basePrompt = buildBasePrompt(this.paths, { mode, now: new Date(), platform, channel: metadata?.channel });
 
     // Expose the current event to tools so notify_owner can capture context.
     if (this.toolRegistry?.setEventContext) {
@@ -382,8 +383,11 @@ export class AgentEngine {
     let totalTokens = 0;
     let currentMessages = [...messages];
 
-    for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-      const isLastRound = round === MAX_TOOL_ROUNDS - 1;
+    // Voice calls bound the tool loop tighter to keep latency low — dead air on
+    // a phone call is far worse than a slightly shallower answer.
+    const maxRounds = metadata?.channel === 'voice' ? VOICE_MAX_TOOL_ROUNDS : MAX_TOOL_ROUNDS;
+    for (let round = 0; round < maxRounds; round++) {
+      const isLastRound = round === maxRounds - 1;
 
       const result = await this.provider.chat(currentMessages, {
         tools: isLastRound ? undefined : tools, // no tools on last round to force text response
@@ -577,14 +581,14 @@ export class AgentEngine {
    * meta. Auto-clears (returns false) if the pause is older than the max
    * duration — a safety net for admins who forget to resume.
    *
-   * Max pause duration default: 24h. Override via config.pauseMaxHours.
+   * Max pause duration default: 1h. Override via config.pauseMaxHours.
    */
   _isSessionPaused(platform, userId) {
     const paused = this.sessionManager.getSessionMeta(platform, userId, 'paused');
     if (!paused) return false;
 
     const pausedAt = this.sessionManager.getSessionMeta(platform, userId, 'paused_at');
-    const maxHours = this.config.pauseMaxHours || 24;
+    const maxHours = this.config.pauseMaxHours || 1;
     if (pausedAt) {
       const ageMs = Date.now() - new Date(pausedAt).getTime();
       if (Number.isFinite(ageMs) && ageMs > maxHours * 60 * 60 * 1000) {

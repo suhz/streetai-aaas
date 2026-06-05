@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { useApi } from '../hooks/useApi.js';
 import { SiTelegram, SiWhatsapp, SiDiscord, SiSlack } from 'react-icons/si';
 import { HiGlobeAlt, HiCommandLine } from 'react-icons/hi2';
-import { TbRelationManyToMany } from 'react-icons/tb';
+import { TbRelationManyToMany, TbPhone } from 'react-icons/tb';
 import truuzeIcon from '../assets/truuze-icon.png';
 import openclawIcon from '../assets/openclaw-icon.png';
 
@@ -12,6 +12,7 @@ const PLATFORM_ICONS = {
   openclaw: { Icon: () => <img src={openclawIcon} alt="OpenClaw" style={{ width: 20, height: 20, borderRadius: 4 }} /> },
   telegram: { Icon: SiTelegram, color: '#29a9eb' },
   whatsapp: { Icon: SiWhatsapp, color: '#25d366' },
+  telnyx:   { Icon: TbPhone, color: '#00c389' },
   discord:  { Icon: SiDiscord, color: '#5865f2' },
   slack:    { Icon: SiSlack, color: '#e01e5a' },
   relay:    { Icon: TbRelationManyToMany, color: '#8b5cf6' },
@@ -23,6 +24,7 @@ const PLATFORM_META = {
   openclaw: { label: 'OpenClaw',  color: '#f59e0b', desc: 'Agent gateway', supported: true, help: 'Sync your workspace to OpenClaw\'s agent directory so others can discover and use your agent.' },
   telegram: { label: 'Telegram',  color: '#29a9eb', desc: 'Telegram bot integration', supported: true, help: 'Connect a Telegram bot so users can chat with your agent directly in Telegram. Requires a bot token from @BotFather.' },
   whatsapp: { label: 'WhatsApp',  color: '#25d366', desc: 'WhatsApp Business API', supported: true, help: 'Connect to WhatsApp Business API so customers can message your agent via WhatsApp. Requires Meta Business credentials.' },
+  telnyx:   { label: 'Phone (Telnyx)', color: '#00c389', desc: 'Voice calls — take orders & bookings by phone', supported: true, help: 'Telnyx runs the phone call (speech to text and back); your agent is the brain. Best with the Public Link (Relay) so no public server is needed. Requires a Telnyx Voice AI Assistant and a phone number.' },
   discord:  { label: 'Discord',   color: '#5865f2', desc: 'Discord bot integration', supported: true, help: 'Add your agent as a Discord bot that can respond to messages in your server channels.' },
   slack:    { label: 'Slack',     color: '#e01e5a', desc: 'Slack app integration', supported: true, help: 'Install your agent as a Slack app that can respond to messages in your workspace channels.' },
   http:     { label: 'HTTP API',  color: '#10b981', desc: 'REST API + chat widget (requires public server)', supported: true, help: 'Run a local REST API on your machine. Best for development or when you have a server with a public IP. Includes an embeddable chat widget.' },
@@ -105,6 +107,11 @@ export default function Deploy() {
   // Relay form
   const [relayName, setRelayName] = useState('');
   const [relayResult, setRelayResult] = useState(null);
+
+  const [telnyxModel, setTelnyxModel] = useState('aaas');
+  const [telnyxPublicUrl, setTelnyxPublicUrl] = useState('');
+  const [telnyxPort, setTelnyxPort] = useState('3302');
+  const [telnyxResult, setTelnyxResult] = useState(null);
   // Owner verification
   const [verifyPending, setVerifyPending] = useState([]);
 
@@ -286,6 +293,10 @@ export default function Deploy() {
           return;
         }
         body.name = relayName.trim();
+      } else if (platform === 'telnyx') {
+        if (telnyxModel.trim()) body.model = telnyxModel.trim();
+        if (telnyxPublicUrl.trim()) body.publicUrl = telnyxPublicUrl.trim();
+        if (telnyxPort.trim()) body.port = parseInt(telnyxPort) || 3302;
       }
       const result = await api.post(`/api/connections/${platform}`, body);
       if (platform === 'relay' && result?.connections) {
@@ -293,6 +304,9 @@ export default function Deploy() {
         if (relayConn?.config) {
           setRelayResult(relayConn.config);
         }
+      } else if (platform === 'telnyx' && result?.connections) {
+        const tc = result.connections.find(c => c.platform === 'telnyx');
+        if (tc?.config) setTelnyxResult(tc.config);
       } else {
         setShowForm(null);
       }
@@ -336,6 +350,13 @@ export default function Deploy() {
     setActing(null);
   };
 
+  const toggleAutoStart = async (platform, enabled) => {
+    try {
+      await api.post(`/api/deploy/${platform}/autostart`, { enabled });
+      await load();
+    } catch (err) { alert('Failed: ' + err.message); }
+  };
+
   if (loading) return <div className="page-loading">Loading...</div>;
 
   const connected = deployStatus?.platforms || [];
@@ -372,7 +393,7 @@ export default function Deploy() {
       {/* Connected platforms */}
       {connected.length > 0 && (
         <div className="deploy-grid">
-          {connected.map(({ platform, config, status: pStatus, error, hasSkill }) => {
+          {connected.map(({ platform, config, status: pStatus, error, hasSkill, autoStart }) => {
             const meta = PLATFORM_META[platform] || { label: platform, color: '#888', icon: '?', desc: '' };
             const isRunning = pStatus === 'connected';
             const isCli = pStatus === 'cli-managed';
@@ -519,12 +540,18 @@ export default function Deploy() {
                             <span>Platform Skill</span>
                             <span className={hasSkill ? 'deploy-skill-ok' : 'deploy-skill-missing'}>{hasSkill ? 'loaded' : 'none'}</span>
                           </div>
+                          <div className="deploy-detail">
+                            <span title="Start this connector automatically when the dashboard launches">Auto-Start</span>
+                            <label style={{ display: 'inline-flex', alignItems: 'center', cursor: 'pointer' }}>
+                              <input type="checkbox" checked={!!autoStart} onChange={e => toggleAutoStart(platform, e.target.checked)} />
+                            </label>
+                          </div>
                         </div>
                         {error && <div className="deploy-error">{error}</div>}
                       </>
                     )}
                   </div>
-                  <div className="card-footer" style={{ display: 'flex', gap: 8 }}>
+                  <div className="card-footer" style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                     {!editingTruuze && (
                       <button className="btn" onClick={() => {
                         const provider = config.agentProvider || 'custom';
@@ -587,6 +614,14 @@ export default function Deploy() {
                     <span>Platform Skill</span>
                     <span className={hasSkill ? 'deploy-skill-ok' : 'deploy-skill-missing'}>{hasSkill ? 'loaded' : 'none'}</span>
                   </div>
+                  {platform !== 'openclaw' && (
+                    <div className="deploy-detail">
+                      <span title="Start this connector automatically when the dashboard launches">Auto-Start</span>
+                      <label style={{ display: 'inline-flex', alignItems: 'center', cursor: 'pointer' }}>
+                        <input type="checkbox" checked={!!autoStart} onChange={e => toggleAutoStart(platform, e.target.checked)} />
+                      </label>
+                    </div>
+                  )}
                   {error && <div className="deploy-error">{error}</div>}
 
                   {/* Public Chat API URL */}
@@ -1144,6 +1179,72 @@ Content-Type: application/json
               <p style={{ margin: '10px 0 4px', color: 'var(--text)', fontWeight: 500 }}>Testing:</p>
               <p style={{ margin: '0' }}>Meta gives you a test number. Add your phone as a recipient in <strong>API Setup</strong> → <strong>To</strong> field. Send a WhatsApp message from your phone to the test number. You should see the agent reply.</p>
             </div>
+          </div>
+        </div>
+      )}
+
+      {showForm === 'telnyx' && (
+        <div ref={formRef} className="card deploy-form-card">
+          <div className="card-header" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+            <span>Connect Phone (Telnyx)</span>
+            <button className="btn btn-sm" onClick={() => { setShowForm(null); setTelnyxResult(null); }}>Cancel</button>
+          </div>
+          <div className="card-body">
+            <p className="form-hint" style={{ marginBottom: 12 }}>Telnyx runs the phone call — it listens to the caller and speaks your agent's replies. Your agent is the brain. Callers can place orders and bookings by voice, using the same logic as your chat channels.</p>
+
+            {!telnyxResult ? (
+              <>
+                <div className="form-group">
+                  <label>Model name</label>
+                  <input type="text" value={telnyxModel} onChange={e => setTelnyxModel(e.target.value)} className="form-input" placeholder="aaas" />
+                  <p className="form-hint">Shown to Telnyx as the model id. Leave as "aaas" unless you have a reason to change it.</p>
+                </div>
+                <div className="form-group">
+                  <label>Public URL <span style={{ color: 'var(--text-muted)' }}>(direct mode only)</span></label>
+                  <input type="text" value={telnyxPublicUrl} onChange={e => setTelnyxPublicUrl(e.target.value)} className="form-input" placeholder="https://your-tunnel.trycloudflare.com" />
+                  <p className="form-hint">Only used if the Public Link (Relay) is NOT connected. A tunnel or public host Telnyx can reach. With the Relay connected, leave this blank.</p>
+                </div>
+                <div className="form-group">
+                  <label>Port <span style={{ color: 'var(--text-muted)' }}>(direct mode only)</span></label>
+                  <input type="number" value={telnyxPort} onChange={e => setTelnyxPort(e.target.value)} className="form-input" />
+                  <p className="form-hint">Local port the voice endpoint listens on. Ignored when using the Relay.</p>
+                </div>
+                <div className="form-actions">
+                  <button className="btn btn-primary" onClick={() => connect('telnyx')} disabled={saving}>{saving ? 'Connecting...' : 'Connect'}</button>
+                </div>
+                {formMsg && <p className="form-hint" style={{ color: 'var(--red)', marginTop: 8 }}>{formMsg}</p>}
+              </>
+            ) : (
+              <div style={{ padding: '14px 16px', background: 'rgba(16, 185, 129, 0.08)', border: '1px solid rgba(16, 185, 129, 0.2)', borderRadius: 8, marginBottom: 16 }}>
+                <p style={{ margin: '0 0 10px', fontSize: 13, color: '#10b981', fontWeight: 600 }}>Connected ({telnyxResult.mode} mode). Paste these into your Telnyx assistant's Custom LLM settings:</p>
+                <p style={{ margin: '0 0 2px', fontSize: 12, color: 'var(--text-secondary)' }}>Base URL</p>
+                <pre className="deploy-code-block" style={{ margin: '0 0 8px' }}>{telnyxResult.baseUrl}</pre>
+                <p style={{ margin: '0 0 2px', fontSize: 12, color: 'var(--text-secondary)' }}>API key (Integration Secret)</p>
+                <pre className="deploy-code-block" style={{ margin: '0 0 8px' }}>{telnyxResult.apiKey}</pre>
+                <p style={{ margin: '0 0 2px', fontSize: 12, color: 'var(--text-secondary)' }}>Model</p>
+                <pre className="deploy-code-block" style={{ margin: 0 }}>{telnyxResult.model}</pre>
+              </div>
+            )}
+
+            <div className="deploy-form-divider" />
+            <h4 style={{ margin: '0 0 8px', fontSize: 13, color: 'var(--text)' }}>Real setup checklist</h4>
+
+            <p style={{ margin: '0 0 6px', fontSize: 12, fontWeight: 600, color: 'var(--text)' }}>Here on the dashboard</p>
+            <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.7, marginBottom: 10 }}>
+              <p style={{ margin: '0 0 6px' }}><strong>1.</strong> Connect <strong>Public Link (Relay)</strong> first (recommended — no public server needed). For direct mode instead, fill in the Public URL above.</p>
+              <p style={{ margin: '0 0 6px' }}><strong>2.</strong> Click <strong>Connect</strong> above to get your <strong>Base URL</strong>, <strong>API key</strong>, and <strong>Model</strong>.</p>
+              <p style={{ margin: '0' }}><strong>3.</strong> Make sure the agent is running and online: click <strong>Start</strong> on the <strong>Public Link (Relay)</strong> card (or run the agent). Telnyx can only reach it while it's online.</p>
+            </div>
+
+            <p style={{ margin: '0 0 6px', fontSize: 12, fontWeight: 600, color: 'var(--text)' }}>In your Telnyx account (telnyx.com)</p>
+            <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.7 }}>
+              <p style={{ margin: '0 0 6px' }}><strong>4.</strong> Buy a <strong>voice-enabled phone number</strong> in your country. Many regions have regulatory or registration requirements for business numbers (for example, UAE numbers need Etisalat/du DNCR registration) — check what applies to yours.</p>
+              <p style={{ margin: '0 0 6px' }}><strong>5.</strong> Create a <strong>Voice AI Assistant</strong>. Set a greeting, choose <strong>STT</strong> (e.g. <code>deepgram/nova-3</code>), a <strong>TTS</strong> voice, and pin the <strong>language</strong>.</p>
+              <p style={{ margin: '0 0 6px' }}><strong>6.</strong> Enable <strong>Use Custom LLM</strong> and turn on <strong>forward_metadata</strong>. Paste the <strong>Base URL</strong>, the <strong>API key</strong> (as an Integration Secret), and the <strong>Model</strong> from above.</p>
+              <p style={{ margin: '0 0 6px' }}><strong>7.</strong> <strong>Assign your phone number</strong> to the assistant.</p>
+              <p style={{ margin: '0' }}><strong>8.</strong> Call the number to test. To support multiple languages, use a router assistant that hands off to one assistant per language — all pointing at the same Base URL.</p>
+            </div>
+            <p className="form-hint" style={{ marginTop: 10 }}>The phone number, DNCR registration, and assistant settings live in Telnyx and can't be configured from this dashboard.</p>
           </div>
         </div>
       )}

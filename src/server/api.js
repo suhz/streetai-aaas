@@ -14,6 +14,7 @@ import { extractFiles } from '../connectors/media.js';
 import { buildPlatformSkill, parseTruuzeSkill } from '../connectors/truuze-skill.js';
 import { sendDirectToCustomer } from '../connectors/index.js';
 import { getConnectorMap } from './connector-registry.js';
+import { startConnector } from './connector-control.js';
 
 
 const __api_dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -67,6 +68,14 @@ export function apiRouter(workspace) {
   const paths = getWorkspacePaths(workspace);
 
   // ─── Overview ────────────────────────────────────
+
+  // Agent photo for the dashboard brand. 404 when none — the UI falls back to
+  // the generic hub logo.
+  router.get('/avatar', (req, res) => {
+    const p = path.join(workspace, '.aaas', 'avatar.png');
+    if (!fs.existsSync(p)) return res.sendStatus(404);
+    res.sendFile(p);
+  });
 
   router.get('/overview', (req, res) => {
     const skill = readText(paths.skill) || '';
@@ -367,8 +376,11 @@ export function apiRouter(workspace) {
     const txns = loadAllTransactions(paths, false);
     let count = 0;
     let latestAt = null;
+    // Use the activity timestamp (newer of created_at / updated_at) so the
+    // badge counts customer edits and cancellations, not just brand-new rows.
     for (const t of txns) {
-      const ts = t.created_at;
+      const c = t.created_at, u = t.updated_at;
+      const ts = c && u ? (u > c ? u : c) : (u || c);
       if (ts && (!latestAt || ts > latestAt)) latestAt = ts;
       if (sinceMs != null && !Number.isNaN(sinceMs)) {
         const tms = ts ? Date.parse(ts) : NaN;
@@ -376,6 +388,43 @@ export function apiRouter(workspace) {
       }
     }
     res.json({ count, latestAt });
+  });
+
+  // ─── Storage cleanup: orphaned customer uploads ───
+  // Customer-sent photos/voice/files land in data/inbox/. When the agent
+  // attaches a file to a transaction, that data/... path is recorded in the
+  // transaction's files[]. An "orphaned" upload is one referenced by NO
+  // transaction — deleting it can never break a transaction's file links.
+  // We additionally keep anything newer than `days` so a just-received file
+  // that hasn't been attached yet (still mid-conversation) is never removed.
+  router.get('/storage/cleanup/preview', (req, res) => {
+    const days = req.query.days != null ? Number(req.query.days) : 90;
+    if (!Number.isFinite(days) || days < 0) {
+      return res.status(400).json({ error: 'days must be a non-negative number' });
+    }
+    const r = collectOrphanedUploads(paths, days);
+    res.json({ days, count: r.count, bytes: r.bytes, files: r.files.slice(0, 100) });
+  });
+
+  router.post('/storage/cleanup', (req, res) => {
+    const days = req.body?.days != null ? Number(req.body.days) : 90;
+    if (!Number.isFinite(days) || days < 0) {
+      return res.status(400).json({ error: 'days must be a non-negative number' });
+    }
+    const r = collectOrphanedUploads(paths, days);
+    let deleted = 0, bytes = 0;
+    const errors = [];
+    for (const f of r.files) {
+      const abs = path.join(paths.data, 'inbox', f.name);
+      try {
+        fs.unlinkSync(abs);
+        deleted++;
+        bytes += f.bytes;
+      } catch (e) {
+        errors.push({ file: f.name, error: e.message });
+      }
+    }
+    res.json({ ok: true, days, deleted, bytes, errors });
   });
 
   // Lifecycle metadata for the dashboard's status menu. MUST be declared
@@ -1269,7 +1318,7 @@ export function apiRouter(workspace) {
 
   router.post('/connections/:platform', conditionalPhotoUpload, async (req, res) => {
     const { platform } = req.params;
-    const validPlatforms = ['truuze', 'http', 'openclaw', 'telegram', 'discord', 'slack', 'whatsapp', 'relay'];
+    const validPlatforms = ['truuze', 'http', 'openclaw', 'telegram', 'discord', 'slack', 'whatsapp', 'telnyx', 'relay'];
     if (!validPlatforms.includes(platform)) {
       return res.status(400).json({ error: `Invalid platform. Use: ${validPlatforms.join(', ')}` });
     }
@@ -1563,6 +1612,42 @@ export function apiRouter(workspace) {
           teamName: data.team,
           connectedAt: new Date().toISOString(),
         });
+      } else if (platform === 'telnyx') {
+        // Telnyx voice. We generate the integration secret Telnyx will send as
+        // a Bearer token. If a relay connection exists (production), register
+        // the secret with streetai.org and use the relay-fronted Base URL;
+        // otherwise direct mode, where this workspace serves the endpoint.
+        const model = (req.body.model || 'aaas').trim() || 'aaas';
+        const secret = 'sk_telnyx_' + crypto.randomBytes(24).toString('hex');
+        const relayConn = loadConnection(workspace, 'relay');
+
+        if (relayConn?.slug && relayConn?.relayKey) {
+          const relayBase = 'https://streetai.org';
+          const r = await fetch(`${relayBase}/relay/configure`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ slug: relayConn.slug, relayKey: relayConn.relayKey, telnyx: { secret } }),
+          });
+          if (!r.ok) {
+            const e = await r.json().catch(() => ({}));
+            return res.status(400).json({ error: e.error || 'Relay configure failed' });
+          }
+          saveConnection(workspace, 'telnyx', {
+            platform: 'telnyx', mode: 'relay', slug: relayConn.slug,
+            apiKey: secret, model,
+            baseUrl: `${relayBase}/telnyx/${relayConn.slug}/v1`,
+            connectedAt: new Date().toISOString(),
+          });
+        } else {
+          const port = parseInt(req.body.port) || 3302;
+          const publicUrl = (req.body.publicUrl || '').trim().replace(/\/$/, '');
+          saveConnection(workspace, 'telnyx', {
+            platform: 'telnyx', mode: 'direct', apiKey: secret, model, port,
+            publicUrl,
+            baseUrl: `${publicUrl || `http://localhost:${port}`}/v1`,
+            connectedAt: new Date().toISOString(),
+          });
+        }
       } else if (platform === 'relay') {
         const { name } = req.body;
         if (!name) return res.status(400).json({ error: 'Agent name is required' });
@@ -1590,6 +1675,20 @@ export function apiRouter(workspace) {
               slug: regData.slug,
               relayKey: regData.relayKey,
               whatsapp: { verifyToken: waConn.verifyToken },
+            }),
+          });
+        }
+
+        // Configure Telnyx voice secret if Telnyx is connected
+        const telnyxConn = loadConnection(workspace, 'telnyx');
+        if (telnyxConn?.apiKey) {
+          await fetch(`${relayBase}/relay/configure`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              slug: regData.slug,
+              relayKey: regData.relayKey,
+              telnyx: { secret: telnyxConn.apiKey },
             }),
           });
         }
@@ -1752,6 +1851,7 @@ export function apiRouter(workspace) {
         status: connector?.status || (daemonRunning ? 'daemon' : 'stopped'),
         error: connector?.error || null,
         hasSkill,
+        autoStart: !!config?.autoStart,
       };
     });
 
@@ -1766,24 +1866,25 @@ export function apiRouter(workspace) {
     const conn = connections.find(c => c.platform === platform);
     if (!conn) return res.status(404).json({ error: `No connection configured for ${platform}.` });
 
-    if (activeConnectors[platform]?.status === 'connected') {
-      return res.json({ ok: true, message: `${platform} already running.` });
-    }
-
     try {
       const eng = await getEngine();
-      const { loadConnector } = await import('../connectors/index.js');
-      const ConnectorClass = await loadConnector(platform);
-      if (!ConnectorClass) return res.status(400).json({ error: `No connector for ${platform}.` });
-
-      const connector = new ConnectorClass({ ...conn.config, platform }, eng);
-      await connector.connect();
-      activeConnectors[platform] = connector;
-
-      res.json({ ok: true, status: connector.status, message: `${platform} started.` });
+      const result = await startConnector(workspace, platform, eng, conn.config);
+      res.json(result);
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
+  });
+
+  // Toggle "start automatically when the dashboard launches" for one platform.
+  // Stored on the connection so it travels with that connector's config.
+  router.post('/deploy/:platform/autostart', (req, res) => {
+    const { platform } = req.params;
+    const conn = loadConnection(workspace, platform);
+    if (!conn) return res.status(404).json({ error: `No connection configured for ${platform}.` });
+    const enabled = !!req.body?.enabled;
+    conn.autoStart = enabled;
+    saveConnection(workspace, platform, conn);
+    res.json({ ok: true, platform, autoStart: enabled });
   });
 
   // Stop a single platform in-process
@@ -1973,6 +2074,50 @@ export function apiRouter(workspace) {
  * Parse a Truuze SKILL.md to extract connection details from frontmatter.
  * Returns { apiBase, provisioningToken, ownerUsername, ownerId } or null.
  */
+/**
+ * Find customer-uploaded files in data/inbox/ that are NOT attached to any
+ * transaction and are older than `days`. Returns { files, count, bytes }.
+ * Used by the storage-cleanup endpoints. Never inspects transaction-attached
+ * files, so it cannot orphan a file a transaction still points to.
+ */
+function collectOrphanedUploads(paths, days) {
+  const inboxDir = path.join(paths.data, 'inbox');
+  const result = { files: [], count: 0, bytes: 0 };
+  if (!fs.existsSync(inboxDir)) return result;
+
+  // Set of every file path referenced by a transaction (active + archived),
+  // normalized to forward-slash workspace-relative form.
+  const referenced = new Set();
+  for (const t of loadAllTransactions(paths, true)) {
+    if (!Array.isArray(t.files)) continue;
+    for (const f of t.files) {
+      if (f && typeof f.path === 'string') {
+        referenced.add(f.path.replace(/\\/g, '/').replace(/^\.\//, ''));
+      }
+    }
+  }
+
+  const cutoffMs = Date.now() - Math.max(0, Number(days) || 0) * 86400000;
+  for (const name of fs.readdirSync(inboxDir)) {
+    const abs = path.join(inboxDir, name);
+    let stat;
+    try { stat = fs.statSync(abs); } catch { continue; }
+    if (!stat.isFile()) continue;
+    const rel = `data/inbox/${name}`;
+    if (referenced.has(rel)) continue;      // attached to a transaction → keep
+    if (stat.mtimeMs > cutoffMs) continue;  // too recent → keep (in-flight safety)
+    result.files.push({
+      name,
+      rel,
+      bytes: stat.size,
+      modified: new Date(stat.mtimeMs).toISOString(),
+    });
+    result.count++;
+    result.bytes += stat.size;
+  }
+  return result;
+}
+
 function loadAllTransactions(paths, includeArchived) {
   // First pass: read every row from disk regardless of `includeArchived` so we
   // can backfill display_index across the full set in stable order before

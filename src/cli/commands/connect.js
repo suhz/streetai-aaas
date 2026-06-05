@@ -2,6 +2,7 @@ import readline from 'readline';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import crypto from 'crypto';
 import chalk from 'chalk';
 import { requireWorkspace, readJson } from '../../utils/workspace.js';
 import { saveConnection, loadConnection } from '../../auth/connections.js';
@@ -50,6 +51,7 @@ export async function connectCommand(platform, opts) {
     case 'discord': return connectDiscord(ws, opts);
     case 'slack': return connectSlack(ws, opts);
     case 'whatsapp': return connectWhatsApp(ws, opts);
+    case 'telnyx': return connectTelnyx(ws, opts);
     case 'relay': return connectRelay(ws, opts);
   }
 }
@@ -573,6 +575,18 @@ async function connectRelay(ws, opts) {
       console.log(chalk.green('  ✓ WhatsApp webhook configured'));
     }
 
+    // Configure Telnyx voice if it's already connected
+    const telnyxConn = loadConnection(ws, 'telnyx');
+    if (telnyxConn?.apiKey) {
+      console.log(chalk.gray('  Configuring Telnyx voice...'));
+      await fetch(`${relayBase}/relay/configure`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ slug, relayKey, telnyx: { secret: telnyxConn.apiKey } }),
+      });
+      console.log(chalk.green('  ✓ Telnyx voice configured'));
+    }
+
     // Save relay connection
     const relayUrl = relayBase.replace(/^https:/, 'wss:').replace(/^http:/, 'ws:');
     saveConnection(ws, 'relay', {
@@ -602,6 +616,77 @@ async function connectRelay(ws, opts) {
     }
 
     console.log(chalk.gray(`  Run ${chalk.bold('aaas run')} to start. The relay handles all inbound traffic.\n`));
+    rl.close();
+  } catch (err) {
+    console.error(chalk.red(`\n  Error: ${err.message}\n`));
+    rl.close();
+  }
+}
+
+async function connectTelnyx(ws, opts) {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const ask = (q) => new Promise((resolve) => rl.question(q, resolve));
+
+  try {
+    console.log(chalk.blue('\n  Connect Telnyx voice\n'));
+    console.log(chalk.gray('  Telnyx runs the phone call (speech in and out); this agent is the brain.\n'));
+
+    const model = opts.model || 'aaas';
+    const secret = 'sk_telnyx_' + crypto.randomBytes(24).toString('hex');
+    const relayBase = opts.baseUrl || 'https://streetai.org';
+
+    const relayConn = loadConnection(ws, 'relay');
+    let baseUrl;
+
+    if (relayConn?.slug && relayConn?.relayKey) {
+      // Relay (production) mode — streetai.org fronts the public endpoint.
+      console.log(chalk.gray('  Configuring Telnyx on the relay...'));
+      const r = await fetch(`${relayBase}/relay/configure`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ slug: relayConn.slug, relayKey: relayConn.relayKey, telnyx: { secret } }),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        console.error(chalk.red(`\n  Relay configure failed: ${err.error || r.status}\n`));
+        rl.close();
+        return;
+      }
+      saveConnection(ws, 'telnyx', {
+        platform: 'telnyx', mode: 'relay', slug: relayConn.slug,
+        apiKey: secret, model, connectedAt: new Date().toISOString(),
+      });
+      baseUrl = `${relayBase.replace(/\/$/, '')}/telnyx/${relayConn.slug}/v1`;
+      console.log(chalk.green('\n  ✓ Configured via relay. Saved to .aaas/connections/telnyx.json\n'));
+    } else {
+      // Direct (prototype) mode — this workspace serves the endpoint itself.
+      const port = parseInt(opts.port) || 3302;
+      let publicUrl = opts.publicUrl || '';
+      if (!publicUrl) {
+        console.log(chalk.gray('  No relay connection found — using direct mode.'));
+        console.log(chalk.gray('  Telnyx must reach this endpoint over a public URL (a tunnel like'));
+        console.log(chalk.gray('  cloudflared, or a host with a public IP).\n'));
+        publicUrl = (await ask(`  Public URL (blank = http://localhost:${port}): `)).trim();
+      }
+      saveConnection(ws, 'telnyx', {
+        platform: 'telnyx', mode: 'direct', apiKey: secret, model, port,
+        publicUrl: publicUrl || '', connectedAt: new Date().toISOString(),
+      });
+      const host = publicUrl ? publicUrl.replace(/\/$/, '') : `http://localhost:${port}`;
+      baseUrl = `${host}/v1`;
+      console.log(chalk.green('\n  ✓ Saved to .aaas/connections/telnyx.json (direct mode)\n'));
+    }
+
+    console.log(chalk.bold('  Configure your Telnyx Voice AI Assistant (Custom LLM):\n'));
+    console.log(chalk.gray('  Base URL:'));
+    console.log(`    ${baseUrl}`);
+    console.log(chalk.gray('  API key (Integration Secret):'));
+    console.log(`    ${secret}`);
+    console.log(chalk.gray('  Model:'));
+    console.log(`    ${model}\n`);
+    console.log(chalk.gray('  In the assistant: enable "Use Custom LLM" and "forward_metadata", set the'));
+    console.log(chalk.gray('  greeting, STT (e.g. deepgram/nova-3), TTS voice and language, then assign'));
+    console.log(chalk.gray('  your Telnyx phone number.\n'));
     rl.close();
   } catch (err) {
     console.error(chalk.red(`\n  Error: ${err.message}\n`));

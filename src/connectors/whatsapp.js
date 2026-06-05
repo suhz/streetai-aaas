@@ -4,6 +4,7 @@ import express from 'express';
 import { createServer } from 'http';
 import { BaseConnector } from './index.js';
 import { readFileBuffer } from './media.js';
+import { buildInboundContent } from './inbound-media.js';
 import { writePlatformSkill } from '../utils/workspace.js';
 import { loadConnection } from '../auth/connections.js';
 
@@ -149,12 +150,7 @@ export default class WhatsAppConnector extends BaseConnector {
                 if (mediaItems.length > 0) {
                   const safeUser = String(userName).replace(/[^a-zA-Z0-9._-]/g, '_');
                   const savedFiles = await this._downloadMedia(mediaItems, safeUser);
-                  if (savedFiles.length > 0) {
-                    const fileList = savedFiles.map(f => `${f.type}: ${f.path}`).join(', ');
-                    content = content
-                      ? `${content}\n\n[Attached files: ${fileList}]`
-                      : `[Attached files: ${fileList}]`;
-                  }
+                  content = await buildInboundContent(this.engine, content, savedFiles);
                 }
 
                 // ── Owner-reply routing ────────────────────────────────

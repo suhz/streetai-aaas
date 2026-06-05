@@ -114,7 +114,7 @@ export function hubRouter(hubDir) {
       let photo = null;
       const aaasDir = path.join(wsPath, '.aaas');
       if (fs.existsSync(aaasDir)) {
-        const avatarFile = fs.readdirSync(aaasDir).find(f => f.startsWith('avatar.'));
+        const avatarFile = fs.readdirSync(aaasDir).find(f => /^avatar\.(png|jpe?g|webp|gif)$/i.test(f));
         if (avatarFile) {
           const mtime = fs.statSync(path.join(aaasDir, avatarFile)).mtimeMs;
           photo = `/api/hub/avatar/${entry.name}/${avatarFile}?t=${Math.floor(mtime)}`;
@@ -210,7 +210,7 @@ export function hubRouter(hubDir) {
       let photo = null;
       const aaasDir = path.join(wsPath, '.aaas');
       if (fs.existsSync(aaasDir)) {
-        const avatarFile = fs.readdirSync(aaasDir).find(f => f.startsWith('avatar.'));
+        const avatarFile = fs.readdirSync(aaasDir).find(f => /^avatar\.(png|jpe?g|webp|gif)$/i.test(f));
         if (avatarFile) {
           const mtime = fs.statSync(path.join(aaasDir, avatarFile)).mtimeMs;
           photo = `/api/hub/avatar/${path.basename(wsPath)}/${avatarFile}?t=${Math.floor(mtime)}`;

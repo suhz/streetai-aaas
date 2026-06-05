@@ -6,6 +6,7 @@ import { extractFiles, readFileBuffer } from './media.js';
 import { loadConnection } from '../auth/connections.js';
 import { writePlatformSkill } from '../utils/workspace.js';
 import { formatForWhatsApp } from './whatsapp.js';
+import { extractTelnyxEvent, runVoiceTurn } from './telnyx.js';
 
 const RELAY_MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024; // Match the relay upload cap
 const WHATSAPP_MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024; // Documents go up to 100 MB
@@ -180,6 +181,22 @@ Bad (will NOT work):
       await this._handleHttpChat(data);
       return;
     }
+
+    if (data.type === 'telnyx:chat') {
+      await this._handleTelnyxChat(data);
+      return;
+    }
+  }
+
+  // ─── Telnyx voice handling ───────────────────────────────────
+  // streetai.org receives Telnyx's OpenAI-format request, forwards it here over
+  // the WebSocket, and frames our reply back to Telnyx as SSE/JSON. We just run
+  // the turn and respond with plain spoken text (formatForVoice strips markdown).
+  async _handleTelnyxChat(data) {
+    const body = data.payload || {};
+    const { userId, content, language } = extractTelnyxEvent(body);
+    const text = await runVoiceTurn(this.engine, { userId, content, language });
+    this._respond(data.requestId, { content: text, model: body.model || 'aaas' });
   }
 
   // ─── WhatsApp webhook handling ───────────────────────────────

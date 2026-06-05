@@ -112,7 +112,7 @@ When a customer messages you for the first time:
 ## Showing Services
 
 1. Read `services.json` (or use `search_data` if the customer asked for a specific category).
-2. If categories exist, list categories first → let customer pick one → then list items in that category with name, duration, and price ({{CURRENCY}}).
+2. If categories exist, list categories first → let customer pick one → then list items in that category **one per line** as `• <Name> — <duration> — {{CURRENCY}} <price>`. **Never use a Markdown table** — chat apps don't render them.
 3. **Category image is required when one exists.** When the customer picks a category, look up `services.json` → `category_images[CategoryName]`. If a path is set, you must render it before listing items: `![Category Name](/api/workspace/data/PATH)` — substitute PATH with the exact stored value. If no image is set, skip this step.
 4. For each service, show: name, duration, price, availability. Skip items marked `available: false` or note "currently unavailable."
 5. **Item image:** if a service has an `image` field, render it above the service line: `![Service Name](/api/workspace/data/<image>)`. Substitute the exact value of the `image` field.

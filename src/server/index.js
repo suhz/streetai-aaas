@@ -5,6 +5,7 @@ import { fileURLToPath } from 'url';
 import { spawn } from 'child_process';
 import chalk from 'chalk';
 import { apiRouter } from './api.js';
+import { autoStartConnectors } from './connector-control.js';
 import { hubRouter } from './hub.js';
 import { getValidWorkspaces } from '../utils/registry.js';
 
@@ -136,9 +137,32 @@ export async function startServer(workspace, port, hubDir, openPath = '/') {
   const url = `http://localhost:${port}`;
   const openUrl = openPath !== '/' ? `${url}${openPath}` : url;
 
+  // Bring up any connectors flagged to start with the dashboard. Per-workspace,
+  // per-connector, opt-in; skips anything already running or owned by a daemon.
+  // Best-effort and fully isolated so it can never delay or fail server boot.
+  async function autoStartAll() {
+    let workspaces;
+    try { workspaces = getValidWorkspaces(); } catch { return; }
+    for (const w of workspaces) {
+      try {
+        const results = await autoStartConnectors(w.path);
+        for (const r of results) {
+          if (r.ok && !r.skipped) {
+            console.log(chalk.green(`  Auto-started ${r.platform} for ${path.basename(w.path)}`));
+          } else if (r.error) {
+            console.log(chalk.yellow(`  Auto-start ${r.platform} (${path.basename(w.path)}) failed: ${r.error}`));
+          }
+        }
+      } catch (e) {
+        console.log(chalk.yellow(`  Auto-start skipped for ${path.basename(w.path)}: ${e.message}`));
+      }
+    }
+  }
+
   const server = app.listen(port, () => {
     console.log(chalk.green(`  Dashboard running at ${chalk.bold(url)}\n`));
     openBrowserDetached(openUrl);
+    autoStartAll();
   });
 
   // If the port is already taken, check whether it's our own dashboard. If

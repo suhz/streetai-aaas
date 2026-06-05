@@ -43,6 +43,10 @@
   /* "New since last visit" highlight in the transactions list. Pink so it
      stands out from the (often teal/grey) accent and from status badges. */
   --highlight-new: #ec4899;
+  /* Customer changed an existing transaction since last visit (amber) and
+     the stronger case where they cancelled it (red). */
+  --highlight-updated: #f59e0b;
+  --highlight-cancelled: #ef4444;
 }
 
 :root[data-theme="light"] {
@@ -84,6 +88,8 @@
   --sidebar-active: #432a48;
   --sidebar-accent: #e08fc8;
   --highlight-new: #db2777;
+  --highlight-updated: #d97706;
+  --highlight-cancelled: #dc2626;
 }
 
 :root[data-theme="light"] .sidebar {
@@ -155,6 +161,25 @@ a:hover { color: var(--text); }
 
 .sidebar-logo svg {
   flex-shrink: 0;
+}
+
+.sidebar-avatar {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  object-fit: cover;
+  flex-shrink: 0;
+}
+
+.sidebar-agent-name {
+  font-size: 20px;
+  font-weight: 800;
+  letter-spacing: -0.03em;
+  line-height: 1.25;
+  color: var(--sidebar-text);
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 /* Logo colors */
@@ -260,11 +285,43 @@ a:hover { color: var(--text); }
   color: var(--sidebar-accent);
 }
 
+/* Agent health LED — shown at the end of the agent name in the sidebar brand */
+.status-led-inline {
+  display: inline-block;
+  margin-left: 8px;
+  vertical-align: middle;
+}
+.status-led {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: currentColor;
+  flex-shrink: 0;
+}
+.status-led-pulse {
+  animation: led-pulse 2s ease-in-out infinite;
+}
+@keyframes led-pulse {
+  0%   { box-shadow: 0 0 0 0 color-mix(in srgb, currentColor 70%, transparent); }
+  70%  { box-shadow: 0 0 0 6px transparent; }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+
 .sidebar-footer {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 8px;
   padding: 16px 22px;
   font-size: 11px;
   color: var(--sidebar-text-muted);
   border-top: 1px solid var(--sidebar-border);
+}
+
+/* Keep the GitHub/version line sitting on the same bottom edge as the
+   (taller) sound-toggle icon button. */
+.sidebar-footer-meta {
+  line-height: 1.2;
 }
 
 .sidebar-footer a {
@@ -425,6 +482,37 @@ a:hover { color: var(--text); }
   50%      { box-shadow: inset 5px 0 0 0 color-mix(in srgb, var(--highlight-new) 55%, transparent); }
 }
 
+/* Customer-updated rows — amber accent, no pulse (less urgent than NEW). */
+.table tr.txn-row-updated td {
+  background: color-mix(in srgb, var(--highlight-updated) 14%, transparent);
+}
+.table tr.txn-row-updated:hover td {
+  background: color-mix(in srgb, var(--highlight-updated) 22%, var(--bg-card-hover));
+}
+.table tr.txn-row-updated td:first-child {
+  box-shadow: inset 5px 0 0 0 var(--highlight-updated);
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* Customer-cancelled rows — red accent, pulses to demand attention. */
+.table tr.txn-row-cancelled td {
+  background: color-mix(in srgb, var(--highlight-cancelled) 14%, transparent);
+}
+.table tr.txn-row-cancelled:hover td {
+  background: color-mix(in srgb, var(--highlight-cancelled) 22%, var(--bg-card-hover));
+}
+.table tr.txn-row-cancelled td:first-child {
+  box-shadow: inset 5px 0 0 0 var(--highlight-cancelled);
+  font-weight: 600;
+  color: var(--text);
+  animation: txn-cancelled-pulse 2.4s ease-in-out infinite;
+}
+@keyframes txn-cancelled-pulse {
+  0%, 100% { box-shadow: inset 5px 0 0 0 var(--highlight-cancelled); }
+  50%      { box-shadow: inset 5px 0 0 0 color-mix(in srgb, var(--highlight-cancelled) 55%, transparent); }
+}
+
 /* "NEW" pill rendered inline with the # cell when a row is highlighted */
 .txn-new-pill {
   display: inline-block;
@@ -439,6 +527,22 @@ a:hover { color: var(--text); }
   vertical-align: middle;
   line-height: 1.4;
 }
+/* UPDATED / CANCELLED pills — same shape as NEW, different colors. */
+.txn-updated-pill,
+.txn-cancelled-pill {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  border-radius: 999px;
+  color: white;
+  vertical-align: middle;
+  line-height: 1.4;
+}
+.txn-updated-pill { background: var(--highlight-updated); }
+.txn-cancelled-pill { background: var(--highlight-cancelled); }
 
 /* ═══ Status badges ═══ */
 .badge {

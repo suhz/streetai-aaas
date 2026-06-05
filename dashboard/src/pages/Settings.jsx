@@ -12,6 +12,31 @@ const PROVIDERS = [
   { value: 'openrouter', label: 'OpenRouter', hasOAuth: false },
   { value: 'azure', label: 'Azure OpenAI', hasOAuth: true },
   { value: 'deepseek', label: 'DeepSeek', hasOAuth: false },
+  { value: 'groq', label: 'Groq', hasOAuth: false },
+];
+
+// Speech-to-text providers offered for the "Voice messages" card. Any
+// OpenAI-compatible /audio/transcriptions provider can be added here; the
+// engine resolves the API key from the matching credential. The first model
+// listed is the default for that provider.
+const VOICE_PROVIDERS = [
+  {
+    value: 'groq',
+    label: 'Groq (Whisper)',
+    models: [
+      { value: 'whisper-large-v3-turbo', label: 'Whisper Large v3 Turbo — fast (recommended)' },
+      { value: 'whisper-large-v3', label: 'Whisper Large v3 — most accurate' },
+    ],
+  },
+  {
+    value: 'openai',
+    label: 'OpenAI (Whisper)',
+    models: [
+      { value: 'whisper-1', label: 'Whisper (whisper-1)' },
+      { value: 'gpt-4o-mini-transcribe', label: 'GPT-4o mini transcribe' },
+      { value: 'gpt-4o-transcribe', label: 'GPT-4o transcribe — most accurate' },
+    ],
+  },
 ];
 
 export default function Settings() {
@@ -536,6 +561,17 @@ export default function Settings() {
           </div>
         </div>
 
+        {/* Voice messages */}
+        <VoiceMessagesCard
+          config={config}
+          api={api}
+          configuredProviders={config?.configuredProviders || []}
+          onSaved={loadConfig}
+        />
+
+        {/* Storage cleanup */}
+        <StorageCleanupCard />
+
         {/* Navigation — per-workspace setting, hidden at hub root since
             the hub sidebar uses its own nav config (not workspaceNav). */}
         {workspace && (
@@ -598,6 +634,284 @@ export default function Settings() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+/**
+ * "Voice messages" card. Self-contained setup for inbound voice-note
+ * transcription: enable it, pick the service + model, and — if no key exists
+ * for that service yet — paste the API key right here. The key is saved to the
+ * shared credentials store (same place LLM keys live), so it's never a
+ * voice-only duplicate; a key already configured for the LLM is reused.
+ */
+function VoiceMessagesCard({ config, api, configuredProviders, onSaved }) {
+  const [enabled, setEnabled] = useState(false);
+  const [provider, setProvider] = useState('groq');
+  const [model, setModel] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState('');
+
+  // Inline API key entry (only shown when the chosen provider has no key).
+  const [apiKey, setApiKey] = useState('');
+  const [savingKey, setSavingKey] = useState(false);
+  const [keyMsg, setKeyMsg] = useState('');
+
+  const selected = VOICE_PROVIDERS.find(p => p.value === provider) || VOICE_PROVIDERS[0];
+  const models = selected?.models || [];
+  const defaultModel = models[0]?.value || '';
+
+  useEffect(() => {
+    const v = config?.voice || {};
+    setEnabled(!!v.enabled);
+    const prov = v.provider || 'groq';
+    setProvider(prov);
+    const provModels = (VOICE_PROVIDERS.find(p => p.value === prov)?.models) || [];
+    setModel(v.model || provModels[0]?.value || '');
+  }, [config]);
+
+  const changeProvider = (val) => {
+    setProvider(val);
+    const provModels = (VOICE_PROVIDERS.find(p => p.value === val)?.models) || [];
+    setModel(provModels[0]?.value || '');
+    setApiKey('');
+    setKeyMsg('');
+  };
+
+  const hasKey = configuredProviders.some(p => p.name === provider);
+
+  const saveKey = async () => {
+    if (!apiKey.trim()) return;
+    setSavingKey(true); setKeyMsg('');
+    try {
+      await api.post('/api/credentials', { provider, apiKey: apiKey.trim() });
+      setApiKey('');
+      setKeyMsg('Key saved!');
+      onSaved?.();  // reload config → configuredProviders refreshes → field hides
+    } catch (e) {
+      setKeyMsg('Error: ' + e.message);
+    }
+    setSavingKey(false);
+  };
+
+  const save = async () => {
+    setSaving(true); setMsg(''); setKeyMsg('');
+    try {
+      // If the user typed a key but didn't click "Save key", persist it as
+      // part of this Save so a single click does everything.
+      if (enabled && !hasKey && apiKey.trim()) {
+        await api.post('/api/credentials', { provider, apiKey: apiKey.trim() });
+        setApiKey('');
+      }
+      await api.put('/api/config', {
+        voice: { enabled, provider, model: model || defaultModel },
+      });
+      setMsg('Saved!');
+      onSaved?.();
+      setTimeout(() => setMsg(''), 2500);
+    } catch (e) {
+      setMsg('Error: ' + e.message);
+    }
+    setSaving(false);
+  };
+
+  return (
+    <div className="card">
+      <div className="card-header">Voice messages</div>
+      <div className="card-body">
+        <p className="form-hint" style={{ marginTop: 0 }}>
+          Let customers send voice notes on WhatsApp and Telegram. When on, each
+          voice note is turned into text so your agent can understand and reply.
+          The language is detected automatically.
+        </p>
+
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', marginBottom: 12 }}>
+          <input type="checkbox" checked={enabled} onChange={e => setEnabled(e.target.checked)} />
+          <span>Understand customer voice notes</span>
+        </label>
+
+        {enabled && (
+          <>
+            <div className="form-group">
+              <label>Transcription service</label>
+              <select className="form-select" value={provider} onChange={e => changeProvider(e.target.value)}>
+                {VOICE_PROVIDERS.map(p => <option key={p.value} value={p.value}>{p.label}</option>)}
+              </select>
+            </div>
+
+            <div className="form-group">
+              <label>Model</label>
+              <select className="form-select" value={model} onChange={e => setModel(e.target.value)}>
+                {models.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
+              </select>
+            </div>
+
+            {hasKey ? (
+              <p className="form-hint" style={{ color: 'var(--green)' }}>
+                ✓ API key for “{provider}” is configured. Manage or remove it in the <strong>Configured Providers</strong> card above.
+              </p>
+            ) : (
+              <div className="form-group">
+                <label>{selected?.label} API key</label>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <input
+                    type="password"
+                    className="form-input"
+                    value={apiKey}
+                    onChange={e => setApiKey(e.target.value)}
+                    placeholder="Paste your API key"
+                    style={{ flex: 1 }}
+                  />
+                  <button className="btn" onClick={saveKey} disabled={savingKey || !apiKey.trim()}>
+                    {savingKey ? 'Saving…' : 'Save key'}
+                  </button>
+                </div>
+                {keyMsg && (
+                  <p className="form-hint" style={{ marginTop: 6, color: keyMsg.startsWith('Error') ? 'var(--text-error)' : 'var(--green)' }}>
+                    {keyMsg}
+                  </p>
+                )}
+              </div>
+            )}
+          </>
+        )}
+
+        <button className="btn btn-primary" onClick={save} disabled={saving}>
+          {saving ? 'Saving…' : 'Save'}
+        </button>
+        {msg && (
+          <p className="form-hint" style={{ marginTop: 8, color: msg.startsWith('Error') ? 'var(--text-error)' : 'var(--green)' }}>
+            {msg}
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** Human-readable file size. */
+function formatBytes(n) {
+  if (!n || n < 1) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let v = n, i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return `${v.toFixed(i === 0 || v >= 10 ? 0 : 1)} ${units[i]}`;
+}
+
+const CLEANUP_RANGES = [
+  { label: '30 days', days: 30 },
+  { label: '90 days', days: 90 },
+  { label: '6 months', days: 180 },
+  { label: '1 year', days: 365 },
+];
+
+/**
+ * "Free up storage" card. Deletes leftover customer uploads that were never
+ * attached to an order/booking. Picking a range auto-previews; deleting still
+ * requires an explicit confirm.
+ */
+function StorageCleanupCard() {
+  const api = useApi();
+  const [days, setDays] = useState(90);
+  const [preview, setPreview] = useState(null);   // { count, bytes }
+  const [checking, setChecking] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState('');
+
+  // Auto-preview whenever the selected range changes (and on first render).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setChecking(true); setError(''); setResult(null); setConfirming(false); setPreview(null);
+      try {
+        const r = await api.get(`/api/storage/cleanup/preview?days=${days}`);
+        if (!cancelled) setPreview(r);
+      } catch (e) {
+        if (!cancelled) setError(e.message || 'Could not check right now.');
+      }
+      if (!cancelled) setChecking(false);
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [days]);
+
+  const runDelete = async () => {
+    setDeleting(true); setError('');
+    try {
+      const r = await api.post('/api/storage/cleanup', { days });
+      setResult(r);
+      setPreview(null);
+      setConfirming(false);
+    } catch (e) {
+      setError(e.message || 'Could not delete right now.');
+    }
+    setDeleting(false);
+  };
+
+  return (
+    <div className="card">
+      <div className="card-header">Free up storage</div>
+      <div className="card-body">
+        <p className="form-hint" style={{ marginTop: 0 }}>
+          Removes leftover files customers sent in chat that were never attached to
+          an order or booking. Attached and recent files are always kept.
+        </p>
+
+        <div className="form-group">
+          <label>Delete unattached files older than</label>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 4 }}>
+            {CLEANUP_RANGES.map(r => (
+              <button
+                key={r.days}
+                className={`btn ${days === r.days ? 'btn-primary' : ''}`}
+                onClick={() => setDays(r.days)}
+              >
+                {r.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {checking && <p className="form-hint" style={{ margin: 0 }}>Checking…</p>}
+
+        {!checking && preview && !confirming && (
+          preview.count > 0 ? (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+              <span style={{ fontSize: 13, color: 'var(--text)' }}>
+                <strong>{preview.count}</strong> file{preview.count === 1 ? '' : 's'} · <strong>{formatBytes(preview.bytes)}</strong> can be freed
+              </span>
+              <button className="btn btn-danger" onClick={() => setConfirming(true)}>Delete</button>
+            </div>
+          ) : (
+            <p className="form-hint" style={{ margin: 0 }}>Nothing to clean up. ✅</p>
+          )
+        )}
+
+        {confirming && preview && (
+          <div style={{ padding: 12, border: '1px solid var(--border)', borderRadius: 8, background: 'var(--bg-secondary)' }}>
+            <p style={{ fontSize: 13, margin: '0 0 10px', color: 'var(--text)' }}>
+              Permanently delete {preview.count} file{preview.count === 1 ? '' : 's'} ({formatBytes(preview.bytes)})? This can't be undone.
+            </p>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button className="btn btn-danger" onClick={runDelete} disabled={deleting}>
+                {deleting ? 'Deleting…' : 'Yes, delete'}
+              </button>
+              <button className="btn" onClick={() => setConfirming(false)} disabled={deleting}>Cancel</button>
+            </div>
+          </div>
+        )}
+
+        {result && (
+          <p className="form-hint" style={{ margin: 0, color: 'var(--green)' }}>
+            Deleted {result.deleted} file{result.deleted === 1 ? '' : 's'}, freed {formatBytes(result.bytes)}.
+            {result.errors?.length > 0 && ` (${result.errors.length} couldn't be removed.)`}
+          </p>
+        )}
+
+        {error && <p className="form-hint" style={{ margin: 0, color: 'var(--text-error)' }}>{error}</p>}
+      </div>
     </div>
   );
 }

@@ -35,7 +35,7 @@ Your restaurant introduction lives in `restaurant.txt`. **Always read this file*
 2. Ask the variables **one at a time** in the order listed in `data/template.config.json`. Use the `prompt` text from the config as the question. Ask EVERY variable separately — never skip, batch, or reuse an earlier answer for a different variable.
 3. For each variable with a `default`, mention the default in your question (e.g. "Daily operating hours? (default: 11:00 AM – 11:00 PM)"). Accept "default" or "skip" as a shortcut to use the default.
 4. Validate when a `validate` regex is present (currently only CURRENCY — must be 3 uppercase letters).
-5. When ALL variables are answered, call **one** tool: `apply_template_variables({ values: { KEY: "answer", ... } })`. Pass every variable in `values` as a flat key-value object. The tool mechanically substitutes `{{KEY}}` throughout every file in `files_to_substitute` — preserving frontmatter, formatting, and structure exactly. Do NOT use `read_skill`/`write_skill` or `read_data_file`/`write_data_file` to do the substitution yourself; the dedicated tool is faster and reliable.
+5. When ALL variables are answered, call **one** tool: `apply_template_variables({ values: { KEY: "answer", ... } })`. Pass every variable in `values` as a flat key-value object. The tool mechanically substitutes the template variables throughout every file in `files_to_substitute` — preserving frontmatter, formatting, and structure exactly. Do NOT use `read_skill`/`write_skill` or `read_data_file`/`write_data_file` to do the substitution yourself; the dedicated tool is faster and reliable.
 6. Inspect the tool's response:
    - If `remaining` is non-empty, ask the owner for the missing variables and call `apply_template_variables` again with just those values, then re-check.
    - Otherwise proceed.
@@ -131,7 +131,7 @@ When a customer messages you for the first time:
 
 2. **Category images are required.** When a customer selects a category, you must always display the corresponding category image before listing items. Retrieve the path from `menu.json` → `category_images[CategoryName]` and render it using markdown: `![Category Name](/api/workspace/data/PATH)` where PATH is the exact value stored in `category_images`. This step is non-negotiable — every category selection must be accompanied by its image.
 
-3. **List items** — after the image, search `menu.json` for items in that category and present them with name and price ({{CURRENCY}}). Keep it brief — name + price per line.
+3. **List items** — after the image, search `menu.json` for items in that category and present them **one item per line** as `• <Name> — {{CURRENCY}} <price>`. Keep it brief. **Never use a Markdown table** — chat apps like Telegram and WhatsApp don't render tables, so they arrive looking broken.
 
 4. **Item image** — if an item has an `image` field, render it above the item's name and price line: `![Item Name](/api/workspace/data/<image>)`. Substitute the exact value of the item's `image` field.
 
