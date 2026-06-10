@@ -1646,7 +1646,15 @@ function MessageBubble({ message }) {
   // images/file pills instead of leaking the raw "[Attached files: ...]"
   // line into the bubble. Format produced by the truuze connector:
   //   "[Attached files: image: data/inbox/foo.jpg, audio: data/inbox/bar.m4a]"
-  const { cleanText, files } = extractAttachedFiles(displayText);
+  // First pull transcribed voice notes (their own format) into a clean
+  // transcript + playable audio clip, then the standard "[Attached files: …]"
+  // markers. Order matters: voice extraction removes the raw audio path so the
+  // marker pass doesn't see it.
+  const { cleanText: afterVoice, files: voiceFiles } = extractVoiceNotes(displayText);
+  const { cleanText, files: markerFiles } = extractAttachedFiles(afterVoice);
+  // Combine voice clips, inline markers, and backend-resolved agent files
+  // (markdown images / data paths the conversation endpoint already extracted).
+  const files = [...voiceFiles, ...markerFiles, ...(Array.isArray(message.files) ? message.files : [])];
 
   // Markdown rendering matches the main Chat page so agent responses with
   // lists / bold / code render properly. `breaks: true` preserves soft
@@ -1686,6 +1694,36 @@ function MessageBubble({ message }) {
 }
 
 /**
+ * Pull transcribed voice notes out of a message and turn them into a clean
+ * transcript line plus a playable audio attachment.
+ *
+ * The connector (inbound-media.js) stores a transcribed voice note as:
+ *   🎤 Customer voice message [data/inbox/x.ogg]: "the transcript"
+ * or, when no speech was understood:
+ *   🎤 Customer sent a voice message [data/inbox/x.ogg] but no speech was detected.
+ *
+ * Without this, the raw file path leaks into the bubble and there's no way to
+ * listen to the clip. We render the audio (so it's playable) and show just the
+ * transcript text (or a short placeholder when nothing was transcribed).
+ *
+ * Returns { cleanText, files } with files entries shaped { type:'audio', path }.
+ */
+function extractVoiceNotes(text) {
+  if (!text) return { cleanText: text, files: [] };
+  const files = [];
+  const voiceRe = /🎤\s*Customer (?:voice message|sent a voice message)\s*\[([^\]]+)\](?::\s*"([^"]*)"|[^\n]*)?/g;
+  const cleanText = text
+    .replace(voiceRe, (_match, filePath, transcript) => {
+      files.push({ type: 'audio', path: filePath.trim() });
+      const t = (transcript || '').trim();
+      return t ? `🎤 "${t}"` : '🎤 Voice message';
+    })
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  return { cleanText, files };
+}
+
+/**
  * Pull `[Attached files: type: path, ...]` blocks out of a message string.
  * Returns the cleaned text (with all markers removed and surrounding blank
  * lines collapsed) plus a list of `{ type, path }` entries.
@@ -1717,16 +1755,21 @@ function extractAttachedFiles(text) {
  */
 function AttachedFiles({ files }) {
   const resolveUrl = useResolveUrl();
-  const urlFor = (p) => resolveUrl(`/api/workspace/${p}`);
-  const isImage = (f) => f.type === 'image' || /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(f.path);
-  const isAudio = (f) => f.type === 'audio' || /\.(mp3|wav|m4a|ogg|flac)$/i.test(f.path);
-  const isVideo = (f) => f.type === 'video' || /\.(mp4|webm|mov|avi)$/i.test(f.path);
+  // Entries come in two shapes:
+  //   - inline markers from customer messages → { type, path }   (workspace path)
+  //   - backend-resolved agent files          → { type, url, name } (ready URL)
+  const urlFor = (f) => (f.url ? resolveUrl(f.url) : resolveUrl(`/api/workspace/${f.path}`));
+  const nameFor = (f) => f.name || (f.path ? f.path.split('/').pop() : 'file');
+  const refOf = (f) => f.path || f.url || f.name || '';
+  const isImage = (f) => f.type === 'image' || /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(refOf(f));
+  const isAudio = (f) => f.type === 'audio' || /\.(mp3|wav|m4a|ogg|flac)$/i.test(refOf(f));
+  const isVideo = (f) => f.type === 'video' || /\.(mp4|webm|mov|avi)$/i.test(refOf(f));
 
   return (
     <div className="chat-msg-files" style={{ marginTop: 8 }}>
       {files.map((f, i) => {
-        const url = urlFor(f.path);
-        const name = f.path.split('/').pop();
+        const url = urlFor(f);
+        const name = nameFor(f);
         if (isImage(f)) {
           return (
             <a key={i} className="chat-file-image" href={url} target="_blank" rel="noopener noreferrer">

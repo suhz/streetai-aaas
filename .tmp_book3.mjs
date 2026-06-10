@@ -1,0 +1,15 @@
+import fs from 'fs';
+import { AgentEngine } from './src/engine/index.js';
+const ws = process.cwd() + '/lifer_hospital';
+const config = JSON.parse(fs.readFileSync(ws + '/.aaas/config.json', 'utf8'));
+const engine = new AgentEngine({ workspace: ws, provider: config.provider, config });
+await engine.initialize();
+const uid = '+971509998877';
+const say = async (c) => { const r = await engine.processEvent({ platform:'telnyx', userId:uid, userName:uid, type:'message', content:c, metadata:{ mode:'customer', channel:'voice', language:'Arabic' } }); console.log('\n👤', c, '\n🤖', r.response || '(EMPTY)', '\n   tools:', (r.toolsUsed||[]).map(t=>t.name).join(', ')||'none'); };
+await say('أريد موعد مع طبيب أطفال يوم الأحد القادم الساعة الحادية عشرة صباحًا');
+await say('اسمي سارة محمد، رقمي ٩٧١٥٠٩٩٩٨٨٧٧، والسبب فحص دوري لطفلي');
+await say('نعم أؤكد');
+const dir = ws + '/transactions/active';
+const files = fs.existsSync(dir) ? fs.readdirSync(dir).filter(f=>f.endsWith('.json')) : [];
+console.log('\n=== transaction created:', files.length ? files.join(',') : 'NONE');
+process.exit(0);

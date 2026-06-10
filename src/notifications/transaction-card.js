@@ -11,11 +11,21 @@ const EVENTS = {
   completed: { emoji: '✅', verb: 'Completed' },
 };
 
+// Keys that hold the customer's name/identity, in precedence order. The header
+// renders a single "Customer" line from the first non-empty one, so every key
+// here is also skipped as a field line below — otherwise the same value shows
+// twice (e.g. "Customer: John" plus "Name: John").
+const CUSTOMER_KEYS = [
+  'user_name', 'customer_name', 'customer', 'full_name', 'client_name',
+  'user', 'client', 'name', 'username',
+];
+
 // Fields never shown as a line (either in the header, internal, or noisy).
 const SKIP_FIELDS = new Set([
-  'service', 'id', 'display_index', 'user_id', 'user', 'client', 'status',
+  'service', 'id', 'display_index', 'user_id', 'status',
   'currency', 'created_at', 'updated_at', 'completed_at', 'cancelled_at',
   'archived', 'archived_at', 'session_platform', '_file',
+  ...CUSTOMER_KEYS,
 ]);
 
 const TERMINAL = new Set(['completed', 'cancelled']);
@@ -26,6 +36,67 @@ function prettifyKey(k) {
 
 function htmlEscape(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// True for a non-empty array whose entries are all objects (e.g. order items,
+// sub_transactions). These render as a multi-line bulleted block, not one line.
+function isObjectList(value) {
+  return Array.isArray(value) && value.length > 0 && value.every(v => v && typeof v === 'object');
+}
+
+// Tight measurement units render glued to the number ("1kg", "500g", "2L");
+// word-like units ("box", "dozen", "plate") read better with a space ("2 box").
+const TIGHT_UNITS = new Set(['kg', 'g', 'mg', 'l', 'ml', 'cl', 'lb', 'oz', 'cc', 'm', 'cm', 'mm']);
+
+// Build the quantity prefix for an item line.
+//  - quantity + unit     → use the unit as written ("1kg", "2 box"), no "×"
+//  - bare numeric count  → multiplier style ("2×")
+//  - quantity that already carries its own unit ("1kg", "2 plates") → as-is
+//  - no quantity         → empty (a lone unit is meaningless, drop it)
+function itemPrefix(qty, unit) {
+  const hasQty = qty !== null && qty !== undefined && String(qty).trim() !== '';
+  if (!hasQty) return ''; // without a number, a unit on its own says nothing
+  if (unit) {
+    const u = String(unit).trim();
+    const glue = TIGHT_UNITS.has(u.toLowerCase()) ? '' : ' ';
+    return `${qty}${glue}${u}`;
+  }
+  // Only a plain number gets the "×" multiplier. A quantity string that already
+  // includes its unit ("1kg") is shown verbatim so we don't produce "1kg×".
+  return /^\d+(\.\d+)?$/.test(String(qty).trim()) ? `${qty}×` : String(qty).trim();
+}
+
+// Pull a per-item special note / modifiers off an item object. Covers a free-
+// text note field and modifier/option lists (e.g. "no onions", "extra cheese").
+function itemNote(it) {
+  const parts = [];
+  const direct = it.note || it.notes || it.special || it.special_instructions
+    || it.instructions || it.comment;
+  if (direct && typeof direct !== 'object') parts.push(String(direct).trim());
+
+  const mods = it.modifiers || it.options || it.extras || it.addons || it.add_ons;
+  if (Array.isArray(mods) && mods.length) {
+    parts.push(mods.map(m => (m && typeof m === 'object')
+      ? (m.name || m.label || m.value || JSON.stringify(m))
+      : String(m)).join(', '));
+  } else if (typeof mods === 'string' && mods.trim()) {
+    parts.push(mods.trim());
+  }
+  return parts.filter(Boolean).join(', ');
+}
+
+// Turn an array of item objects into one display string each ("1kg Tomato",
+// "2× Pizza — no onions"). Honors an optional `unit` field and per-item notes.
+function formatItemLines(value) {
+  return value.map(it => {
+    const qty = it.quantity ?? it.qty;
+    const unit = it.unit || it.units || it.measure || '';
+    const name = it.name || it.item || JSON.stringify(it);
+    const prefix = itemPrefix(qty, unit);
+    const base = prefix ? `${prefix} ${name}` : `${name}`;
+    const note = itemNote(it);
+    return note ? `${base} — ${note}` : base;
+  });
 }
 
 function formatValue(key, value, viewConfig, currency) {
@@ -40,18 +111,11 @@ function formatValue(key, value, viewConfig, currency) {
     const d = new Date(value);
     return isNaN(d) ? String(value) : d.toLocaleDateString();
   }
-  // Items / array of objects → "2× Name"
   if (Array.isArray(value)) {
     if (value.length === 0) return null;
-    if (value.every(v => v && typeof v === 'object')) {
-      return value
-        .map(it => {
-          const qty = it.quantity || it.qty;
-          const name = it.name || it.item || JSON.stringify(it);
-          return qty ? `${qty}× ${name}` : `${name}`;
-        })
-        .join(', ');
-    }
+    // Array of objects → "2× Name, ..." (single-line fallback; the card
+    // renderer special-cases these into a bulleted block before calling here).
+    if (isObjectList(value)) return formatItemLines(value).join(', ');
     return value.join(', ');
   }
   if (typeof value === 'object') return null; // skip nested blobs
@@ -83,17 +147,47 @@ export function renderTransactionCard(txn, event, viewConfig) {
 
   // Body lines
   const lines = []; // { label, value }
-  const customer = txn.user_name || txn.user || txn.client;
-  if (customer && customer !== txn.user_id) lines.push({ label: 'Customer', value: String(customer) });
+  let customer;
+  for (const k of CUSTOMER_KEYS) {
+    const v = txn[k];
+    if (v != null && typeof v !== 'object' && String(v).trim() !== '') { customer = String(v).trim(); break; }
+  }
+  if (customer && customer !== txn.user_id) lines.push({ label: 'Customer', value: customer });
+  const customerNorm = customer ? customer.toLowerCase() : null;
 
   for (const key of cardFields(viewConfig)) {
-    if (key in txn) {
-      const val = formatValue(key, txn[key], viewConfig, currency);
-      if (val != null && String(val).trim() !== '') {
-        lines.push({ label: viewConfig?.labels?.[key] || prettifyKey(key), value: val });
+    if (!(key in txn)) continue;
+    const label = viewConfig?.labels?.[key] || prettifyKey(key);
+    // Array-of-objects fields (order items, sub_transactions, …) render as a
+    // bulleted block — one entry per line — instead of a cramped comma list.
+    if (isObjectList(txn[key])) {
+      lines.push({ label, items: formatItemLines(txn[key]) });
+      continue;
+    }
+    const val = formatValue(key, txn[key], viewConfig, currency);
+    if (val != null && String(val).trim() !== '') {
+      // Value-based dedup: never repeat the customer name under another label
+      // (e.g. a "Name" field holding the same value as the Customer header),
+      // regardless of which key it came from.
+      if (customerNorm && String(val).trim().toLowerCase() === customerNorm) continue;
+      lines.push({ label, value: val });
+    }
+  }
+  // Always surface an order-level special note, even when the view config
+  // didn't list it — fulfillment instructions ("ring the bell", "no cutlery")
+  // are order-critical and must not be silently dropped.
+  const NOTE_KEYS = ['special_instructions', 'special_note', 'order_note', 'instructions', 'note', 'notes', 'remarks'];
+  const shownKeys = new Set(cardFields(viewConfig));
+  for (const nk of NOTE_KEYS) {
+    if (nk in txn && !shownKeys.has(nk)) {
+      const v = txn[nk];
+      if (v != null && typeof v !== 'object' && String(v).trim() !== '') {
+        lines.push({ label: viewConfig?.labels?.[nk] || 'Note', value: String(v).trim() });
+        break; // first present note field only — avoid duplicates
       }
     }
   }
+
   if (event === 'cancelled' && txn.cancellation_reason) {
     lines.push({ label: 'Reason', value: String(txn.cancellation_reason) });
   }
@@ -103,10 +197,22 @@ export function renderTransactionCard(txn, event, viewConfig) {
     if (!isNaN(d)) lines.push({ label: 'When', value: d.toLocaleString() });
   }
 
-  // Per-channel rendering
-  const whatsappText = [`${headerPlain}`, '', ...lines.map(l => `*${l.label}:* ${l.value}`)].join('\n');
-  const telegramHtml = [`${htmlEscape(headerPlain)}`, '', ...lines.map(l => `<b>${htmlEscape(l.label)}:</b> ${htmlEscape(l.value)}`)].join('\n');
-  const plainText = [`${headerPlain}`, '', ...lines.map(l => `${l.label}: ${l.value}`)].join('\n');
+  // Per-channel rendering. A line is either a `value` line or an `items`
+  // block (label header followed by one bulleted entry per line).
+  const renderLine = ({ label, value, items }, fmt) => {
+    if (items) {
+      const head = fmt.bold(`${label}:`);
+      return [head, ...items.map(it => `  • ${fmt.esc(it)}`)].join('\n');
+    }
+    return `${fmt.bold(`${label}:`)} ${fmt.esc(value)}`;
+  };
+  const wa = { bold: s => `*${s}*`, esc: s => String(s) };
+  const tg = { bold: s => `<b>${htmlEscape(s)}</b>`, esc: s => htmlEscape(s) };
+  const pt = { bold: s => s, esc: s => String(s) };
+
+  const whatsappText = [`${headerPlain}`, '', ...lines.map(l => renderLine(l, wa))].join('\n');
+  const telegramHtml = [`${htmlEscape(headerPlain)}`, '', ...lines.map(l => renderLine(l, tg))].join('\n');
+  const plainText = [`${headerPlain}`, '', ...lines.map(l => renderLine(l, pt))].join('\n');
 
   // Buttons (only for non-terminal transactions)
   const buttons = TERMINAL.has(txn.status)

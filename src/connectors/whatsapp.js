@@ -9,7 +9,7 @@ import { writePlatformSkill, readJson } from '../utils/workspace.js';
 import { loadConnection } from '../auth/connections.js';
 import { applyTxnButtonAction } from './transaction-actions.js';
 import { renderTransactionCard } from '../notifications/transaction-card.js';
-import { flushPendingWhatsApp } from '../notifications/index.js';
+import { flushPendingWhatsApp, isTransactionActor } from '../notifications/index.js';
 
 const WHATSAPP_API_BASE = 'https://graph.facebook.com/v21.0';
 const WHATSAPP_MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024; // Documents go up to 100 MB
@@ -417,8 +417,11 @@ export default class WhatsAppConnector extends BaseConnector {
    * sent message).
    */
   async _handleButtonReply(fromPhone, btnId) {
-    if (!this.isOwnerFresh(fromPhone)) return; // owner-gated
-    const paths = this.engine.paths;
+    // Authorized = the Notifications-tab recipient, or (legacy) the verified
+    // connection owner. Notifications recipient is the source of truth.
+    const paths = this.engine?.paths;
+    const authorized = (paths && isTransactionActor(paths, 'whatsapp', fromPhone)) || this.isOwnerFresh(fromPhone);
+    if (!authorized) return;
     const res = applyTxnButtonAction(paths, btnId);
     if (!res) return;
     if (!res.ok) {

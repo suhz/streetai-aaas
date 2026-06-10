@@ -567,6 +567,27 @@ export function apiRouter(workspace) {
     return readJson(sessionFp);
   }
 
+  // Sessions now persist tool-call steps (assistant messages carrying
+  // `toolCalls`, usually with empty text) and tool results (`role: 'tool'`) so
+  // the model keeps its call/result context. Neither belongs in the
+  // human-readable conversation — strip them before display.
+  const isDisplayableMessage = (m) => {
+    if (!m || m.role === 'tool') return false;
+    if (m.role === 'assistant') return typeof m.content === 'string' && m.content.trim() !== '';
+    return true; // user / admin messages
+  };
+
+  // Map extractFiles() descriptors to attachment objects the dashboard renders,
+  // resolving workspace paths to /api/workspace URLs. Shared by the conversation
+  // and chat-history endpoints so the URL logic stays in one place.
+  const toAttachments = (files) => files.map(f => ({
+    url: f.url ? f.url : `/api/workspace/${path.relative(workspace, f.absPath).replace(/\\/g, '/')}`,
+    name: f.filename,
+    type: f.type,
+    mimeType: f.mimeType,
+    alt: f.alt,
+  }));
+
   router.get('/transactions/:id/conversation', async (req, res) => {
     const txn = findTransaction(paths, req.params.id);
     if (!txn) return res.status(404).json({ error: 'Transaction not found' });
@@ -578,8 +599,22 @@ export function apiRouter(workspace) {
 
     try {
       const session = loadTxnSession(target);
+      const messages = (session?.messages || []).filter(isDisplayableMessage).map(m => {
+        // Resolve agent-shared file refs (markdown images, bare data/ paths) into
+        // real URLs so they render as attachments instead of broken placeholders
+        // — same treatment /chat/history gives assistant messages. Customer
+        // inbound images use the inline "[Attached files: …]" marker and are
+        // resolved client-side, so only assistant messages need this pass.
+        if (m.role === 'assistant' && typeof m.content === 'string' && m.content) {
+          const { cleanText, files } = extractFiles(workspace, m.content);
+          if (files.length) {
+            return { ...m, content: cleanText, files: toAttachments(files) };
+          }
+        }
+        return m;
+      });
       res.json({
-        messages: session?.messages || [],
+        messages,
         paused: !!session?.meta?.paused,
         paused_at: session?.meta?.paused_at || null,
         customer: {
@@ -1099,20 +1134,14 @@ export function apiRouter(workspace) {
     if (!fs.existsSync(sessionFile)) return res.json({ messages: [] });
     const session = readJson(sessionFile) || {};
     const messages = (session.messages || [])
-      .filter(m => m.role === 'user' || m.role === 'assistant')
+      .filter(isDisplayableMessage)
       .map(m => {
         const rawContent = typeof m.content === 'string' ? m.content : (m.content || '');
         // Extract file references from past assistant messages so historical
         // markdown image links render as real attachments too.
         if (m.role === 'assistant' && rawContent) {
           const { cleanText, files } = extractFiles(workspace, rawContent);
-          const attachments = files.map(f => {
-            const url = f.url
-              ? f.url
-              : `/api/workspace/${path.relative(workspace, f.absPath).replace(/\\/g, '/')}`;
-            return { url, name: f.filename, type: f.type, mimeType: f.mimeType, alt: f.alt };
-          });
-          return { role: m.role, content: cleanText, files: attachments, at: m.at };
+          return { role: m.role, content: cleanText, files: toAttachments(files), at: m.at };
         }
         return { role: m.role, content: rawContent, at: m.at };
       });

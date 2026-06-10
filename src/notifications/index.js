@@ -147,9 +147,16 @@ async function sendTelegram(workspace, ownerCfg, payload) {
   const msgBody = { chat_id: target, text: payload.text || buildText(payload) };
   if (payload.parse_mode) msgBody.parse_mode = payload.parse_mode;
   if (Array.isArray(payload.buttons) && payload.buttons.length) {
-    msgBody.reply_markup = {
-      inline_keyboard: [payload.buttons.map(b => ({ text: b.title, callback_data: b.id }))],
-    };
+    // Telegram inline keyboards allow mixing callback buttons (Complete/Cancel)
+    // and URL buttons (Message Customer) — a button with a `url` opens the link
+    // directly on tap. Keep action buttons on the first row and any link button
+    // on its own row below.
+    const actionRow = payload.buttons.filter(b => !b.url).map(b => ({ text: b.title, callback_data: b.id }));
+    const linkRow = payload.buttons.filter(b => b.url).map(b => ({ text: b.title, url: b.url }));
+    const rows = [];
+    if (linkRow.length) rows.push(linkRow);     // Message Customer on top
+    if (actionRow.length) rows.push(actionRow); // Complete / Cancel below
+    msgBody.reply_markup = { inline_keyboard: rows };
   }
   const res = await fetch(url, {
     method: 'POST',
@@ -375,6 +382,77 @@ export async function testChannel(workspace, paths, channel, payload) {
 // WhatsApp sends that fail (e.g. closed 24h window) are queued and replayed on
 // the owner's next inbound message — see flushPendingWhatsApp.
 
+/**
+ * Build a deep link that opens the customer's chat thread for the owner to
+ * message them directly (human-to-human, outside the agent). Returns
+ * { url, label } or null when the customer has no reachable handle.
+ *
+ *  - WhatsApp customer → https://wa.me/<digits> (user_id is the phone number).
+ *  - Telegram customer → https://t.me/<username>, but only if the customer has
+ *    a public username (reverse-looked-up from the connection's userMap).
+ *    Telegram blocks opening a fresh DM by numeric id, so no username → no link.
+ *  - Truuze / website / anonymous → no external thread → null.
+ *
+ * Note: the link opens the owner's OWN WhatsApp/Telegram, so the message
+ * reaches the customer from the owner's personal account, not the business.
+ */
+export function buildCustomerLink(workspace, txn) {
+  const platform = txn?.session_platform;
+  const uid = txn?.user_id != null ? String(txn.user_id) : '';
+  if (!platform || !uid) return null;
+
+  if (platform === 'whatsapp') {
+    const digits = uid.replace(/[^\d]/g, '');
+    return digits ? { url: `https://wa.me/${digits}`, label: '💬 Message Customer' } : null;
+  }
+
+  if (platform === 'telegram') {
+    try {
+      const conn = loadConnection(workspace, 'telegram');
+      const map = conn?.userMap || {};
+      for (const [uname, chatId] of Object.entries(map)) {
+        if (String(chatId) === uid) return { url: `https://t.me/${uname}`, label: '💬 Message Customer' };
+      }
+    } catch { /* no connection / no map → no link */ }
+    return null; // no username on file → can't deep-link
+  }
+
+  return null; // other platforms have no external chat thread
+}
+
+/**
+ * True if `userId` on `platform` is authorized to act on transaction-card
+ * buttons (Complete / Cancel). The single source of truth is the Notifications
+ * tab: whoever is configured to RECEIVE transaction cards on that channel may
+ * act on them. Change the recipient there and the tap permission moves with it —
+ * no separate, drift-prone "owner" record.
+ *
+ *  - whatsapp → compares against `whatsapp.phone`, digit-normalized so
+ *    "+971 50…" and "971…" match.
+ *  - telegram → compares the numeric tapper id against `telegram.chat_id`
+ *    (also tolerates an @username being configured).
+ */
+export function isTransactionActor(paths, platform, userId) {
+  let config;
+  try { config = loadNotificationsConfig(paths); } catch { return false; }
+
+  if (platform === 'whatsapp') {
+    const recipient = config?.whatsapp?.phone;
+    if (!recipient) return false;
+    const digits = s => String(s).replace(/\D/g, '');
+    return digits(recipient) === digits(userId) && digits(userId) !== '';
+  }
+
+  if (platform === 'telegram') {
+    const recipient = config?.telegram?.chat_id;
+    if (!recipient) return false;
+    const norm = s => String(s).replace(/^@+/, '').trim().toLowerCase();
+    return norm(recipient) === norm(userId) && norm(userId) !== '';
+  }
+
+  return false;
+}
+
 function pendingWhatsAppPath(paths) {
   return path.join(path.dirname(paths.notifications), 'pending_whatsapp.json');
 }
@@ -449,6 +527,13 @@ export async function notifyTransaction(workspace, paths, txn, event) {
   const viewConfig = (() => { try { return readJson(paths.transactionView) || {}; } catch { return {}; } })();
   const card = renderTransactionCard(txn, event, viewConfig);
 
+  // A tap-to-open link to the customer's chat thread, when reachable. Omitted
+  // once the transaction is terminal — no point messaging about a done/cancelled
+  // order from the card. Telegram gets it as a URL button; WhatsApp (whose API
+  // can't mix a URL button with the reply buttons) gets a tappable body line.
+  const TERMINAL = new Set(['completed', 'cancelled']);
+  const link = TERMINAL.has(txn.status) ? null : buildCustomerLink(workspace, txn);
+
   if (config.telegram?.enabled && config.telegram?.chat_id) {
     try {
       // Replace this transaction's previous card so only one current card
@@ -458,8 +543,11 @@ export async function notifyTransaction(workspace, paths, txn, event) {
       if (prev && event !== 'created') {
         await deleteTelegramMessage(workspace, prev.chat_id, prev.message_id);
       }
+      const tgButtons = link
+        ? [...card.buttons, { title: link.label, url: link.url }]
+        : card.buttons;
       const res = await sendTelegram(workspace, config.telegram, {
-        text: card.telegramHtml, parse_mode: 'HTML', buttons: card.buttons,
+        text: card.telegramHtml, parse_mode: 'HTML', buttons: tgButtons,
       });
       if (res?.channel_message_id) {
         setCardRef(paths, txn.id, { telegram: { chat_id: res.sent_to, message_id: res.channel_message_id } });
@@ -468,12 +556,15 @@ export async function notifyTransaction(workspace, paths, txn, event) {
   }
 
   if (config.whatsapp?.enabled && config.whatsapp?.phone) {
+    // Link as the last line of the body, just above the reply buttons
+    // (Complete/Cancel), which WhatsApp pins to the bottom of the message.
+    const waText = link ? `${card.whatsappText}\n\n${link.label}: ${link.url}` : card.whatsappText;
     try {
-      await sendWhatsapp(workspace, config.whatsapp, { text: card.whatsappText, buttons: card.buttons });
+      await sendWhatsapp(workspace, config.whatsapp, { text: waText, buttons: card.buttons });
     } catch (e) {
       // Likely a closed 24h window (or transient) — queue for replay on the
       // owner's next inbound message, which reopens the window.
-      enqueuePendingWhatsApp(paths, { text: card.whatsappText, buttons: card.buttons });
+      enqueuePendingWhatsApp(paths, { text: waText, buttons: card.buttons });
     }
   }
 

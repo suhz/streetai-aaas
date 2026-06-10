@@ -9,7 +9,7 @@ import { formatForWhatsApp } from './whatsapp.js';
 import { extractTelnyxEvent, runVoiceTurn } from './telnyx.js';
 import { applyTxnButtonAction } from './transaction-actions.js';
 import { renderTransactionCard } from '../notifications/transaction-card.js';
-import { flushPendingWhatsApp } from '../notifications/index.js';
+import { flushPendingWhatsApp, isTransactionActor } from '../notifications/index.js';
 import { buildInboundContent } from './inbound-media.js';
 
 const RELAY_MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024; // Match the relay upload cap
@@ -289,9 +289,30 @@ Bad (will NOT work):
     }
   }
 
-  /** True if a WhatsApp sender is the verified owner (for button-tap authority). */
+  /**
+   * True if a WhatsApp sender may act on transaction-card buttons.
+   * Source of truth is the Notifications tab recipient (whoever receives the
+   * cards can act on them). The connection's recorded ownerId is kept as a
+   * legacy fallback so existing /admin-verified setups aren't locked out.
+   * Digits are normalized on both sides so "+971…" vs "971…" can't mismatch.
+   */
   _isWhatsAppOwner(from) {
-    return !!this.whatsappOwnerId && String(from) === String(this.whatsappOwnerId);
+    const paths = this.engine?.paths;
+    if (paths && isTransactionActor(paths, 'whatsapp', from)) return true;
+
+    // Fallback: connection ownerId (read fresh — it's written lazily after
+    // this connector was constructed, so the cached snapshot can be stale).
+    let ownerId = this.whatsappOwnerId;
+    try {
+      const waConn = loadConnection(this.engine?.workspace, 'whatsapp');
+      if (waConn?.ownerId) {
+        ownerId = waConn.ownerId;
+        this.whatsappOwnerId = ownerId; // refresh cache
+      }
+    } catch { /* fall back to the cached value */ }
+    if (!ownerId) return false;
+    const digits = s => String(s).replace(/\D/g, '');
+    return digits(from) === digits(ownerId);
   }
 
   /**

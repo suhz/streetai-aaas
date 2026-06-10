@@ -8,6 +8,7 @@ import { findAlertByChannelMessage, getRecentOpenAlerts } from '../notifications
 import { loadConnection, saveConnection } from '../auth/connections.js';
 import { applyTxnButtonAction } from './transaction-actions.js';
 import { renderTransactionCard } from '../notifications/transaction-card.js';
+import { isTransactionActor } from '../notifications/index.js';
 
 const TELEGRAM_MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024; // Bot API hard limit
 
@@ -413,12 +414,16 @@ export default class TelegramConnector extends BaseConnector {
     const data = cq.data || '';
     if (!data.startsWith('txn:')) { await this._answerCallback(cq.id); return; }
 
-    if (!this.isOwnerFresh(String(cq.from?.id || ''))) {
+    // Authorized = the Notifications-tab recipient, or (legacy) the verified
+    // connection owner. Notifications recipient is the source of truth.
+    const tapper = String(cq.from?.id || '');
+    const paths = this.engine?.paths;
+    const authorized = (paths && isTransactionActor(paths, 'telegram', tapper)) || this.isOwnerFresh(tapper);
+    if (!authorized) {
       await this._answerCallback(cq.id, 'Not authorized.');
       return;
     }
 
-    const paths = this.engine.paths;
     const res = applyTxnButtonAction(paths, data);
     if (!res) { await this._answerCallback(cq.id); return; }
     if (!res.ok) {
