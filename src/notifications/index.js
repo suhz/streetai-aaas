@@ -3,6 +3,7 @@ import path from 'path';
 import { readJson, writeJson } from '../utils/workspace.js';
 import { loadConnection, saveConnection } from '../auth/connections.js';
 import { newAlertId, saveAlert, defaultTtlMs } from './alerts.js';
+import { renderTransactionCard } from './transaction-card.js';
 
 /**
  * Owner notifications. The agent calls notifyOwner({...}) when something
@@ -141,10 +142,19 @@ async function sendTelegram(workspace, ownerCfg, payload) {
   const target = resolved.target;
 
   const url = `https://api.telegram.org/bot${conn.botToken}/sendMessage`;
+  // payload.text overrides the default; payload.parse_mode and payload.buttons
+  // (inline keyboard) are optional — used by transaction cards.
+  const msgBody = { chat_id: target, text: payload.text || buildText(payload) };
+  if (payload.parse_mode) msgBody.parse_mode = payload.parse_mode;
+  if (Array.isArray(payload.buttons) && payload.buttons.length) {
+    msgBody.reply_markup = {
+      inline_keyboard: [payload.buttons.map(b => ({ text: b.title, callback_data: b.id }))],
+    };
+  }
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: target, text: buildText(payload) }),
+    body: JSON.stringify(msgBody),
   });
   const body = await res.json().catch(() => ({}));
   if (!res.ok || body.ok === false) {
@@ -192,18 +202,36 @@ async function sendWhatsapp(workspace, ownerCfg, payload) {
   const accessToken = substitute(conn.accessToken);
   const url = `https://graph.facebook.com/v21.0/${conn.phoneNumberId}/messages`;
   const phone = String(ownerCfg.phone).replace(/[^\d+]/g, '');
+  const text = payload.text || buildText(payload);
+  // With buttons → interactive reply-button message (one tap, no confirm).
+  // Up to 3 buttons; titles capped at 20 chars per WhatsApp limits.
+  let messageBody;
+  if (Array.isArray(payload.buttons) && payload.buttons.length) {
+    messageBody = {
+      messaging_product: 'whatsapp',
+      to: phone,
+      type: 'interactive',
+      interactive: {
+        type: 'button',
+        body: { text },
+        action: {
+          buttons: payload.buttons.slice(0, 3).map(b => ({
+            type: 'reply',
+            reply: { id: b.id, title: b.title.slice(0, 20) },
+          })),
+        },
+      },
+    };
+  } else {
+    messageBody = { messaging_product: 'whatsapp', to: phone, type: 'text', text: { body: text } };
+  }
   const res = await fetch(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${accessToken}`,
     },
-    body: JSON.stringify({
-      messaging_product: 'whatsapp',
-      to: phone,
-      type: 'text',
-      text: { body: buildText(payload) },
-    }),
+    body: JSON.stringify(messageBody),
   });
   const body = await res.json().catch(() => ({}));
   if (!res.ok || body.error) {
@@ -337,4 +365,148 @@ export async function testChannel(workspace, paths, channel, payload) {
   if (channel === 'whatsapp') return await sendWhatsapp(workspace, ownerCfg, msg);
   if (channel === 'email') return await sendEmail(ownerCfg, msg);
   throw new Error(`Unknown channel "${channel}".`);
+}
+
+// ─── Transaction alerts ─────────────────────────────────────────
+//
+// Pushes a per-transaction card to the owner's enabled channels when
+// `transaction_alerts.enabled` is set. Opt-in, off by default. Reuses the same
+// recipients (telegram.chat_id / whatsapp.phone) and senders as owner alerts.
+// WhatsApp sends that fail (e.g. closed 24h window) are queued and replayed on
+// the owner's next inbound message — see flushPendingWhatsApp.
+
+function pendingWhatsAppPath(paths) {
+  return path.join(path.dirname(paths.notifications), 'pending_whatsapp.json');
+}
+
+function enqueuePendingWhatsApp(paths, item) {
+  try {
+    const fp = pendingWhatsAppPath(paths);
+    const list = readJson(fp) || [];
+    list.push({ ...item, queued_at: new Date().toISOString() });
+    fs.mkdirSync(path.dirname(fp), { recursive: true });
+    writeJson(fp, list.slice(-100)); // cap to avoid unbounded growth
+  } catch { /* best-effort */ }
+}
+
+// ─── Telegram "one live card per transaction" ───────────────────
+//
+// We remember the message we sent for each transaction so a later change can
+// delete the stale card and post a fresh one — keeping a single, current card
+// (no lingering buttons on a cancelled order). Telegram-only: WhatsApp can't
+// delete or edit sent messages.
+
+function txnCardsPath(paths) {
+  return path.join(path.dirname(paths.notifications), 'txn_cards.json');
+}
+
+function getCardRef(paths, txnId) {
+  try {
+    const map = readJson(txnCardsPath(paths)) || {};
+    return map[String(txnId)] || null;
+  } catch { return null; }
+}
+
+function setCardRef(paths, txnId, ref) {
+  try {
+    const fp = txnCardsPath(paths);
+    const map = readJson(fp) || {};
+    if (ref) map[String(txnId)] = ref; else delete map[String(txnId)];
+    // Prune oldest entries so the file can't grow without bound. Numeric
+    // transaction-id keys sort ascending, so the first keys are the oldest.
+    const keys = Object.keys(map);
+    if (keys.length > 500) {
+      for (const k of keys.slice(0, keys.length - 500)) delete map[k];
+    }
+    fs.mkdirSync(path.dirname(fp), { recursive: true });
+    writeJson(fp, map);
+  } catch { /* best-effort */ }
+}
+
+async function deleteTelegramMessage(workspace, chatId, messageId) {
+  try {
+    const conn = loadConnection(workspace, 'telegram');
+    if (!conn?.botToken) return;
+    await fetch(`https://api.telegram.org/bot${conn.botToken}/deleteMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, message_id: messageId }),
+    });
+  } catch { /* best-effort — Telegram won't delete messages older than ~48h */ }
+}
+
+/**
+ * Send the owner a card for a transaction event ('created' | 'updated' |
+ * 'cancelled' | 'completed'). Best-effort: never throws. No-op unless
+ * `transaction_alerts.enabled`.
+ */
+export async function notifyTransaction(workspace, paths, txn, event) {
+  let config;
+  try { config = loadNotificationsConfig(paths); } catch { return; }
+  if (!config?.transaction_alerts?.enabled) return;
+  if (!txn) return;
+
+  const viewConfig = (() => { try { return readJson(paths.transactionView) || {}; } catch { return {}; } })();
+  const card = renderTransactionCard(txn, event, viewConfig);
+
+  if (config.telegram?.enabled && config.telegram?.chat_id) {
+    try {
+      // Replace this transaction's previous card so only one current card
+      // exists — the fresh one reflects the new state (and drops the buttons
+      // once terminal). 'created' has no predecessor to remove.
+      const prev = getCardRef(paths, txn.id)?.telegram;
+      if (prev && event !== 'created') {
+        await deleteTelegramMessage(workspace, prev.chat_id, prev.message_id);
+      }
+      const res = await sendTelegram(workspace, config.telegram, {
+        text: card.telegramHtml, parse_mode: 'HTML', buttons: card.buttons,
+      });
+      if (res?.channel_message_id) {
+        setCardRef(paths, txn.id, { telegram: { chat_id: res.sent_to, message_id: res.channel_message_id } });
+      }
+    } catch (e) { console.warn(`[txn-alert] telegram failed: ${e.message}`); }
+  }
+
+  if (config.whatsapp?.enabled && config.whatsapp?.phone) {
+    try {
+      await sendWhatsapp(workspace, config.whatsapp, { text: card.whatsappText, buttons: card.buttons });
+    } catch (e) {
+      // Likely a closed 24h window (or transient) — queue for replay on the
+      // owner's next inbound message, which reopens the window.
+      enqueuePendingWhatsApp(paths, { text: card.whatsappText, buttons: card.buttons });
+    }
+  }
+
+  if (config.email?.enabled && config.email?.to) {
+    try {
+      await sendEmail(config.email, { title: `Transaction #${txn.id}`, message: card.plainText });
+    } catch (e) { console.warn(`[txn-alert] email failed: ${e.message}`); }
+  }
+}
+
+/**
+ * Replay any queued WhatsApp cards, in order, when the owner's window reopens
+ * (called from the WhatsApp connector on an owner inbound message). The window
+ * is open at this point, so cards send with their buttons intact. Best-effort;
+ * cards that still fail stay queued for next time.
+ */
+export async function flushPendingWhatsApp(workspace, paths) {
+  const fp = pendingWhatsAppPath(paths);
+  let list;
+  try { list = readJson(fp); } catch { return; }
+  if (!Array.isArray(list) || list.length === 0) return;
+
+  let config;
+  try { config = loadNotificationsConfig(paths); } catch { return; }
+  if (!config?.whatsapp?.enabled || !config?.whatsapp?.phone) return;
+
+  const remaining = [];
+  for (const item of list) {
+    try {
+      await sendWhatsapp(workspace, config.whatsapp, { text: item.text, buttons: item.buttons });
+    } catch {
+      remaining.push(item); // still failing — keep for next time
+    }
+  }
+  try { writeJson(fp, remaining); } catch { /* best-effort */ }
 }

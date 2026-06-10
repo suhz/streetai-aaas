@@ -788,6 +788,11 @@ export function apiRouter(workspace) {
       if (incoming.email?.smtp && incoming.email.smtp.pass === '••••••••') {
         incoming.email.smtp.pass = existing.email?.smtp?.pass || '';
       }
+      // Preserve transaction_alerts when a per-channel save omits it, so a
+      // channel update doesn't wipe the transaction-alerts toggle.
+      if (incoming.transaction_alerts === undefined && existing.transaction_alerts !== undefined) {
+        incoming.transaction_alerts = existing.transaction_alerts;
+      }
       saveNotificationsConfig(paths, incoming);
       res.json({ ok: true });
     } catch (err) {

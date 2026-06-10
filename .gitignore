@@ -22,6 +22,12 @@ street_ai/
 streetai-book/
 thalassery/
 prataps_the_dhaba/
+rasoi_ghar/
+multy_life_gym/
+infit_bodybuilding_club/
+the_clay_pot_restaurant/
+freshlane/
+archive_fitness/
 
 # Credentials and secrets
 .aaas/credentials.json
@@ -44,3 +50,4 @@ AaaS.txt
 CONTEXT.md
 TELNYX_VOICE_PLAN.md
 CLIENT_INSTALLER_PLAN.md
+issues.txt

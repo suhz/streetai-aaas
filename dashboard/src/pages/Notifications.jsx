@@ -10,6 +10,7 @@ const EMPTY = {
     to: '', from: '',
     smtp: { host: '', port: 587, secure: false, user: '', pass: '', passSet: false },
   },
+  transaction_alerts: { enabled: false },
 };
 
 function mergeConfig(loaded) {
@@ -21,6 +22,7 @@ function mergeConfig(loaded) {
       ...(loaded?.email || {}),
       smtp: { ...EMPTY.email.smtp, ...(loaded?.email?.smtp || {}) },
     },
+    transaction_alerts: { ...EMPTY.transaction_alerts, ...(loaded?.transaction_alerts || {}) },
   };
 }
 
@@ -156,6 +158,22 @@ export default function Notifications() {
     }
   }
 
+  // Transaction alerts: a single opt-in that rides on the channels enabled
+  // below. Persists immediately like the per-channel On/Off switch.
+  async function handleToggleTxnAlerts(val) {
+    const previous = { form, saved };
+    const next = { ...saved, transaction_alerts: { enabled: val } };
+    setForm(f => ({ ...f, transaction_alerts: { enabled: val } }));
+    setSaved(next);
+    try {
+      await put('/api/notifications', next);
+    } catch (err) {
+      setForm(previous.form);
+      setSaved(previous.saved);
+      alert('Could not update transaction alerts: ' + err.message);
+    }
+  }
+
   async function handleSaveChannel(channel) {
     setSavingChannel(channel);
     try {
@@ -226,6 +244,21 @@ export default function Notifications() {
       </div>
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: 16, maxWidth: 720 }}>
+
+        {/* ── Transaction alerts (rides on enabled channels below) ── */}
+        <div className="card" style={{ padding: '14px 18px', display: 'flex', alignItems: 'center', gap: 14 }}>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontSize: 15, fontWeight: 600, color: 'var(--text)' }}>Transaction alerts</div>
+            <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 2 }}>
+              Push every new and cancelled transaction to your phone, with Complete / Cancel buttons. Sent on the channels you've turned on below.
+            </div>
+          </div>
+          <ToggleSwitch
+            checked={!!form.transaction_alerts?.enabled}
+            onChange={handleToggleTxnAlerts}
+            label={form.transaction_alerts?.enabled ? 'On' : 'Off'}
+          />
+        </div>
 
         {/* ── Telegram ── */}
         <ChannelCard

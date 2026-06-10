@@ -4,9 +4,13 @@ import WebSocket from 'ws';
 import { BaseConnector } from './index.js';
 import { extractFiles, readFileBuffer } from './media.js';
 import { loadConnection } from '../auth/connections.js';
-import { writePlatformSkill } from '../utils/workspace.js';
+import { writePlatformSkill, readJson } from '../utils/workspace.js';
 import { formatForWhatsApp } from './whatsapp.js';
 import { extractTelnyxEvent, runVoiceTurn } from './telnyx.js';
+import { applyTxnButtonAction } from './transaction-actions.js';
+import { renderTransactionCard } from '../notifications/transaction-card.js';
+import { flushPendingWhatsApp } from '../notifications/index.js';
+import { buildInboundContent } from './inbound-media.js';
 
 const RELAY_MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024; // Match the relay upload cap
 const WHATSAPP_MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024; // Documents go up to 100 MB
@@ -34,6 +38,7 @@ export default class RelayConnector extends BaseConnector {
 
     // Load WhatsApp credentials if available (for sending replies directly to Meta)
     this.whatsappConfig = null;
+    this.whatsappOwnerId = null; // for owner-gating transaction button taps
     if (engine?.workspace) {
       const waConn = loadConnection(engine.workspace, 'whatsapp');
       if (waConn) {
@@ -42,6 +47,7 @@ export default class RelayConnector extends BaseConnector {
           phoneNumberId: waConn.phoneNumberId,
           apiBase: 'https://graph.facebook.com/v21.0',
         };
+        this.whatsappOwnerId = waConn.ownerId || null;
       }
     }
   }
@@ -212,6 +218,22 @@ Bad (will NOT work):
         if (!value?.messages) continue;
 
         for (const message of value.messages) {
+          // Owner inbound reopens the 24h window — replay any queued
+          // transaction cards (best-effort).
+          if (this._isWhatsAppOwner(message.from)) {
+            flushPendingWhatsApp(this.engine.workspace, this.engine.paths).catch(() => {});
+          }
+
+          // Transaction-card button taps arrive as interactive button_reply.
+          if (message.type === 'interactive') {
+            const btnId = message.interactive?.button_reply?.id || message.interactive?.list_reply?.id;
+            if (btnId) {
+              this._handleWAButton(String(message.from), btnId)
+                .catch(err => console.warn(`[relay:wa] button error: ${err.message}`));
+            }
+            continue;
+          }
+
           const mediaItems = this._extractWAMediaItems(message);
           const textPart = message.type === 'text' ? message.text?.body : (message[message.type]?.caption || '');
           if (!textPart && mediaItems.length === 0) continue;
@@ -222,16 +244,13 @@ Bad (will NOT work):
           try {
             let content = textPart || '';
 
-            // Download incoming media files
+            // Download incoming media, then transcribe voice notes (and append
+            // file references) via the shared helper — same as the Telegram and
+            // direct-WhatsApp connectors, so audio works the same over the relay.
             if (mediaItems.length > 0) {
               const safeUser = String(userName).replace(/[^a-zA-Z0-9._-]/g, '_');
               const savedFiles = await this._downloadWAMedia(mediaItems, safeUser);
-              if (savedFiles.length > 0) {
-                const fileList = savedFiles.map(f => `${f.type}: ${f.path}`).join(', ');
-                content = content
-                  ? `${content}\n\n[Attached files: ${fileList}]`
-                  : `[Attached files: ${fileList}]`;
-              }
+              content = await buildInboundContent(this.engine, content, savedFiles);
             }
 
             const result = await this.engine.processEvent({
@@ -267,6 +286,48 @@ Bad (will NOT work):
           }
         }
       }
+    }
+  }
+
+  /** True if a WhatsApp sender is the verified owner (for button-tap authority). */
+  _isWhatsAppOwner(from) {
+    return !!this.whatsappOwnerId && String(from) === String(this.whatsappOwnerId);
+  }
+
+  /**
+   * Handle a transaction-card button tap forwarded over the relay. One tap =
+   * action, no confirm. Owner-gated. Reuses the shared action handler and sends
+   * a fresh confirmation card (WhatsApp can't edit a sent message).
+   */
+  async _handleWAButton(fromPhone, btnId) {
+    if (!this._isWhatsAppOwner(fromPhone)) return; // owner-gated
+    const paths = this.engine.paths;
+    const res = applyTxnButtonAction(paths, btnId);
+    if (!res) return;
+    if (!res.ok) {
+      await this._sendWARaw(fromPhone, res.error);
+      return;
+    }
+    const card = renderTransactionCard(res.transaction, res.event, readJson(paths.transactionView) || {});
+    await this._sendWARaw(fromPhone, card.whatsappText);
+  }
+
+  /**
+   * Send text to WhatsApp EXACTLY as given (no markdown conversion) via Meta.
+   * Transaction cards already carry WhatsApp-native `*bold*`, so they must not
+   * pass through formatForWhatsApp (which would reinterpret single `*`).
+   */
+  async _sendWARaw(to, text) {
+    if (!text || !this.whatsappConfig) return;
+    const { accessToken, phoneNumberId, apiBase } = this.whatsappConfig;
+    try {
+      await fetch(`${apiBase}/${phoneNumberId}/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
+        body: JSON.stringify({ messaging_product: 'whatsapp', to, type: 'text', text: { body: text } }),
+      });
+    } catch (err) {
+      console.warn(`[relay:wa] Failed to send card: ${err.message}`);
     }
   }
 

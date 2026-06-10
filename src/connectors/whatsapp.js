@@ -5,8 +5,11 @@ import { createServer } from 'http';
 import { BaseConnector } from './index.js';
 import { readFileBuffer } from './media.js';
 import { buildInboundContent } from './inbound-media.js';
-import { writePlatformSkill } from '../utils/workspace.js';
+import { writePlatformSkill, readJson } from '../utils/workspace.js';
 import { loadConnection } from '../auth/connections.js';
+import { applyTxnButtonAction } from './transaction-actions.js';
+import { renderTransactionCard } from '../notifications/transaction-card.js';
+import { flushPendingWhatsApp } from '../notifications/index.js';
 
 const WHATSAPP_API_BASE = 'https://graph.facebook.com/v21.0';
 const WHATSAPP_MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024; // Documents go up to 100 MB
@@ -136,6 +139,24 @@ export default class WhatsAppConnector extends BaseConnector {
           if (!value?.messages) continue;
 
           for (const message of value.messages) {
+            // Owner inbound reopens the 24h window — replay any queued
+            // transaction cards (best-effort, fire-and-forget).
+            try {
+              if (this.isOwnerFresh(String(message.from))) {
+                flushPendingWhatsApp(this.engine.workspace, this.engine.paths).catch(() => {});
+              }
+            } catch { /* best-effort */ }
+
+            // Transaction-card button taps arrive as interactive button_reply.
+            if (message.type === 'interactive') {
+              const btnId = message.interactive?.button_reply?.id || message.interactive?.list_reply?.id;
+              if (btnId) {
+                this._handleButtonReply(String(message.from), btnId)
+                  .catch(err => console.warn(`[whatsapp] button error: ${err.message}`));
+              }
+              continue;
+            }
+
             const mediaItems = this._extractMediaItems(message);
             const textPart = message.type === 'text' ? message.text?.body : (message[message.type]?.caption || '');
             if (!textPart && mediaItems.length === 0) continue;
@@ -389,6 +410,45 @@ export default class WhatsAppConnector extends BaseConnector {
    * bypassing the full event/file pipeline. Used to confirm owner-reply
    * outcomes back to the owner.
    */
+  /**
+   * Handle a transaction-card button tap (interactive button_reply). One tap =
+   * action, no confirm. Owner-gated. Reuses the same transaction functions as
+   * the dashboard, then sends a fresh confirmation card (WhatsApp can't edit a
+   * sent message).
+   */
+  async _handleButtonReply(fromPhone, btnId) {
+    if (!this.isOwnerFresh(fromPhone)) return; // owner-gated
+    const paths = this.engine.paths;
+    const res = applyTxnButtonAction(paths, btnId);
+    if (!res) return;
+    if (!res.ok) {
+      await this._sendOwnerRaw(fromPhone, res.error);
+      return;
+    }
+    const card = renderTransactionCard(res.transaction, res.event, readJson(paths.transactionView) || {});
+    await this._sendOwnerRaw(fromPhone, card.whatsappText);
+  }
+
+  /**
+   * Send text to a phone EXACTLY as given (no markdown conversion). Transaction
+   * cards already carry WhatsApp-native `*bold*`, so they must not pass through
+   * formatForWhatsApp (which would reinterpret single `*` as italic).
+   */
+  async _sendOwnerRaw(phoneNumber, text) {
+    if (!text) return;
+    for (const chunk of this._splitMessage(text, 4000)) {
+      try {
+        await fetch(`${this.apiBase}/${this.phoneNumberId}/messages`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${this.accessToken}` },
+          body: JSON.stringify({ messaging_product: 'whatsapp', to: phoneNumber, type: 'text', text: { body: chunk } }),
+        });
+      } catch (err) {
+        console.warn(`[whatsapp] Failed to send card: ${err.message}`);
+      }
+    }
+  }
+
   async _sendOwnerText(phoneNumber, text) {
     if (!text) return;
     const chunks = this._splitMessage(text, 4000);

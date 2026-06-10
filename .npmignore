@@ -19,6 +19,12 @@ street_ai/
 streetai-book/
 thalassery/
 prataps_the_dhaba/
+rasoi_ghar/
+multy_life_gym/
+infit_bodybuilding_club/
+the_clay_pot_restaurant/
+freshlane/
+archive_fitness/
 
 # Dev files
 dashboard/src/
@@ -48,3 +54,4 @@ log.txt
 # OS
 .DS_Store
 Thumbs.db
+issues.txt

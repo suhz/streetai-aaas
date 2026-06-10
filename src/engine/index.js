@@ -428,6 +428,18 @@ export class AgentEngine {
       if (result.providerExtras) assistantMsg.providerExtras = result.providerExtras;
       currentMessages.push(assistantMsg);
 
+      // Persist a trimmed copy of this tool-call step to the session so future
+      // turns see that actions go through real tool calls (which stops the model
+      // from later fabricating "done" without calling the tool) and so it
+      // remembers what it did. Best-effort — never breaks the turn.
+      try {
+        this.sessionManager.addMessage(platform, userId, {
+          role: 'assistant',
+          content: result.content || '',
+          toolCalls: result.toolCalls.map(tc => ({ ...tc, arguments: this._trimArgs(tc.arguments) })),
+        });
+      } catch { /* best-effort */ }
+
       for (const tc of result.toolCalls) {
         toolsUsed.push({ name: tc.name, arguments: tc.arguments });
         // Inject mode into run_query so it can block DDL in customer mode
@@ -455,6 +467,15 @@ export class AgentEngine {
           toolCallId: tc.id,
           content: toolResult,
         });
+        // Persist the matching (trimmed) tool result so the call/result pair
+        // stays intact in history.
+        try {
+          this.sessionManager.addMessage(platform, userId, {
+            role: 'tool',
+            toolCallId: tc.id,
+            content: this._trimToolResult(tc.name, toolResult),
+          });
+        } catch { /* best-effort */ }
       }
     }
 
@@ -600,6 +621,44 @@ export class AgentEngine {
       }
     }
     return true;
+  }
+
+  /**
+   * Cap large string values inside tool-call arguments before persisting them
+   * to the session, so a call like write_data_file can't bloat the history.
+   * Structure is preserved so the provider can still format the call. The full
+   * arguments are still used within the turn — only the persisted copy is trimmed.
+   */
+  _trimArgs(args, depth = 0) {
+    if (!args || typeof args !== 'object' || depth > 4) return args;
+    const out = Array.isArray(args) ? [] : {};
+    for (const [k, v] of Object.entries(args)) {
+      if (typeof v === 'string' && v.length > 200) out[k] = v.slice(0, 200) + '…[truncated]';
+      else if (v && typeof v === 'object') out[k] = this._trimArgs(v, depth + 1);
+      else out[k] = v;
+    }
+    return out;
+  }
+
+  /**
+   * Reduce a tool result to a compact form for the session history. Transaction
+   * results keep their essential outcome (id/status); everything else is capped.
+   * The full result is still used within the current turn — only the persisted
+   * copy is trimmed, so large data never accumulates across turns.
+   */
+  _trimToolResult(name, resultStr) {
+    if (!resultStr) return resultStr;
+    const TXN = ['create_transaction', 'update_transaction', 'complete_transaction', 'cancel_transaction'];
+    if (TXN.includes(name)) {
+      try {
+        const p = JSON.parse(resultStr);
+        const t = p.transaction || {};
+        return JSON.stringify({ ok: p.ok ?? !p.error, id: p.id ?? t.id, status: t.status, error: p.error });
+      } catch { /* fall through to generic cap */ }
+    }
+    const CAP = 600;
+    if (resultStr.length <= CAP) return resultStr;
+    return resultStr.slice(0, CAP) + ` …[truncated ${resultStr.length - CAP} chars; re-run the tool for full data]`;
   }
 
   /**

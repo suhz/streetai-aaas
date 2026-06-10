@@ -3,9 +3,11 @@ import path from 'path';
 import { BaseConnector, clearPausedSessionsForPlatform } from './index.js';
 import { readFileBuffer } from './media.js';
 import { buildInboundContent } from './inbound-media.js';
-import { writePlatformSkill } from '../utils/workspace.js';
+import { writePlatformSkill, readJson } from '../utils/workspace.js';
 import { findAlertByChannelMessage, getRecentOpenAlerts } from '../notifications/alerts.js';
 import { loadConnection, saveConnection } from '../auth/connections.js';
+import { applyTxnButtonAction } from './transaction-actions.js';
+import { renderTransactionCard } from '../notifications/transaction-card.js';
 
 const TELEGRAM_MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024; // Bot API hard limit
 
@@ -104,7 +106,7 @@ export default class TelegramConnector extends BaseConnector {
       try {
         this.pollController = new AbortController();
         const resp = await fetch(
-          `${this.apiBase}/getUpdates?offset=${this.offset}&timeout=30&allowed_updates=["message"]`,
+          `${this.apiBase}/getUpdates?offset=${this.offset}&timeout=30&allowed_updates=["message","callback_query"]`,
           { signal: this.pollController.signal }
         );
 
@@ -133,6 +135,13 @@ export default class TelegramConnector extends BaseConnector {
 
         for (const update of data.result) {
           this.offset = update.update_id + 1;
+
+          // Transaction-card button taps arrive as callback_query updates.
+          if (update.callback_query) {
+            try { await this._handleCallbackQuery(update.callback_query); }
+            catch (err) { console.warn(`[telegram] callback error: ${err.message}`); }
+            continue;
+          }
 
           const msg = update.message;
           if (!msg) continue;
@@ -395,6 +404,57 @@ export default class TelegramConnector extends BaseConnector {
    * full event/file machinery. Used to confirm owner-reply outcomes
    * back to the owner.
    */
+  /**
+   * Handle a transaction-card button tap (callback_query). One tap = action,
+   * no confirm. Owner-gated. Reuses the same transaction functions the
+   * dashboard uses, then edits the card to reflect the new state.
+   */
+  async _handleCallbackQuery(cq) {
+    const data = cq.data || '';
+    if (!data.startsWith('txn:')) { await this._answerCallback(cq.id); return; }
+
+    if (!this.isOwnerFresh(String(cq.from?.id || ''))) {
+      await this._answerCallback(cq.id, 'Not authorized.');
+      return;
+    }
+
+    const paths = this.engine.paths;
+    const res = applyTxnButtonAction(paths, data);
+    if (!res) { await this._answerCallback(cq.id); return; }
+    if (!res.ok) {
+      await this._answerCallback(cq.id, res.error.slice(0, 190));
+      return;
+    }
+
+    await this._answerCallback(cq.id, res.event === 'completed' ? 'Marked complete ✓' : 'Cancelled ✓');
+    // Re-render the card in its new (terminal) state and drop the buttons.
+    try {
+      const viewConfig = readJson(paths.transactionView) || {};
+      const card = renderTransactionCard(res.transaction, res.event, viewConfig);
+      await this._editMessage(cq.message.chat.id, cq.message.message_id, card.telegramHtml);
+    } catch { /* card edit is best-effort */ }
+  }
+
+  async _answerCallback(callbackQueryId, text) {
+    try {
+      await fetch(`${this.apiBase}/answerCallbackQuery`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ callback_query_id: callbackQueryId, text: text || undefined }),
+      });
+    } catch { /* best-effort */ }
+  }
+
+  async _editMessage(chatId, messageId, html) {
+    try {
+      await fetch(`${this.apiBase}/editMessageText`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, message_id: messageId, text: html, parse_mode: 'HTML' }),
+      });
+    } catch { /* best-effort */ }
+  }
+
   async _sendOwnerText(chatId, text) {
     if (!text) return;
     const chunks = this._splitMessage(text, 4096);

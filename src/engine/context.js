@@ -97,7 +97,12 @@ export class ContextAssembler {
       totalTokens += estimateTokens(summaryMsg);
     }
 
-    const recentMessages = this.selectRecentMessages(sessionMessages, this.budgets.session);
+    let recentMessages = this.selectRecentMessages(sessionMessages, this.budgets.session);
+    // The recent window (after budget truncation / compression) must never
+    // contain a tool result without its assistant tool-call, or an assistant
+    // tool-call without its result — providers reject dangling pairs. This is a
+    // no-op for plain text-only history.
+    recentMessages = this.sanitizeToolMessages(recentMessages);
     for (const msg of recentMessages) {
       messages.push(msg);
       totalTokens += estimateTokens(typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content));
@@ -132,6 +137,40 @@ export class ContextAssembler {
     }
 
     return truncated;
+  }
+
+  /**
+   * Guarantee tool-call/tool-result pairing integrity in a message window.
+   * Drops tool results whose assistant tool-call isn't present, and strips
+   * tool-calls from an assistant message whose results aren't present. This
+   * protects against budget truncation or compression slicing a pair apart.
+   * No-op for messages without tool calls.
+   */
+  sanitizeToolMessages(msgs) {
+    if (!msgs || msgs.length === 0) return msgs || [];
+    const hasToolStuff = msgs.some(m => m.role === 'tool' || (Array.isArray(m.toolCalls) && m.toolCalls.length));
+    if (!hasToolStuff) return msgs; // common case: plain text history
+
+    const resultIds = new Set();
+    for (const m of msgs) if (m.role === 'tool' && m.toolCallId) resultIds.add(m.toolCallId);
+
+    const out = [];
+    for (const m of msgs) {
+      if (m.role === 'tool') {
+        const hasCall = out.some(x =>
+          x.role === 'assistant' && Array.isArray(x.toolCalls) &&
+          x.toolCalls.some(tc => tc.id === m.toolCallId));
+        if (hasCall) out.push(m); // else: orphan result — drop
+      } else if (m.role === 'assistant' && Array.isArray(m.toolCalls) && m.toolCalls.length) {
+        const kept = m.toolCalls.filter(tc => resultIds.has(tc.id));
+        if (kept.length === m.toolCalls.length) out.push(m);
+        else if (kept.length > 0) out.push({ ...m, toolCalls: kept });
+        else { const { toolCalls, ...rest } = m; out.push(rest); } // no results → plain text
+      } else {
+        out.push(m);
+      }
+    }
+    return out;
   }
 
   /**

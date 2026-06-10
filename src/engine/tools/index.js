@@ -9,7 +9,7 @@ import { platformRequest } from './platform-request.js';
 import { webSearch, webFetch } from './web.js';
 import { listConnections } from '../../auth/connections.js';
 import { loadConnectorToolModule } from '../../connectors/index.js';
-import { notifyOwner } from '../../notifications/index.js';
+import { notifyOwner, notifyTransaction } from '../../notifications/index.js';
 import { MemoryManager } from '../memory/index.js';
 import { readText } from '../../utils/workspace.js';
 import { parseTransactionFieldsBlock, parseItemFieldsBlock, buildToolFieldSchema, parseServiceCatalog, parseCurrencyDeclaration } from './transaction-view.js';
@@ -125,6 +125,25 @@ export class ToolRegistry {
    */
   setEventContext(ctx) {
     this.eventContext = ctx || null;
+  }
+
+  /**
+   * Push a transaction card to the owner when a transaction is created or
+   * changed through the tools. Best-effort and fire-and-forget — never affects
+   * the tool's result.
+   *
+   * No mode/owner suppression: session `mode` defaults to 'admin' when unset,
+   * so gating on it would silently drop most notifications (including real
+   * customer orders). Echo isn't a concern here — button taps and dashboard
+   * changes update transactions through other paths, not this hook, so they
+   * never trigger a notification.
+   */
+  _notifyTransactionSafe(event, resultStr) {
+    try {
+      const parsed = JSON.parse(resultStr);
+      if (!parsed || parsed.ok === false || parsed.error || !parsed.transaction) return;
+      notifyTransaction(this.workspace, this.paths, parsed.transaction, event).catch(() => {});
+    } catch { /* best-effort — notifications never break a tool call */ }
   }
 
   /**
@@ -794,6 +813,7 @@ export class ToolRegistry {
           };
           const r = createTransaction(this.paths, argsWithDefaults);
           this._autoLogToolResult('create_transaction', argsWithDefaults, r);
+          this._notifyTransactionSafe('created', r);
           return r;
         }
         case 'update_transaction': {
@@ -802,16 +822,19 @@ export class ToolRegistry {
           if (!v.ok) return JSON.stringify({ error: v.error });
           const r = updateTransaction(this.paths, args);
           this._autoLogToolResult('update_transaction', args, r);
+          this._notifyTransactionSafe('updated', r);
           return r;
         }
         case 'complete_transaction': {
           const r = completeTransaction(this.paths, args);
           this._autoLogToolResult('complete_transaction', args, r);
+          this._notifyTransactionSafe('completed', r);
           return r;
         }
         case 'cancel_transaction': {
           const r = cancelTransaction(this.paths, args, this.eventContext || {});
           this._autoLogToolResult('cancel_transaction', args, r);
+          this._notifyTransactionSafe('cancelled', r);
           return r;
         }
         case 'list_transactions':
