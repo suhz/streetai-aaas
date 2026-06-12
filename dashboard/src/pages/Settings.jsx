@@ -11,6 +11,9 @@ const PROVIDERS = [
   { value: 'ollama', label: 'Ollama (Local)', hasOAuth: false },
   { value: 'openrouter', label: 'OpenRouter', hasOAuth: false },
   { value: 'azure', label: 'Azure OpenAI', hasOAuth: true },
+  { value: 'azure_speech', label: 'Azure Speech (TTS voices)', hasOAuth: false },
+  { value: 'elevenlabs', label: 'ElevenLabs (TTS voices)', hasOAuth: false },
+  { value: 'aimlapi', label: 'AI/ML API (TTS via aimlapi.com)', hasOAuth: false },
   { value: 'deepseek', label: 'DeepSeek', hasOAuth: false },
   { value: 'groq', label: 'Groq', hasOAuth: false },
 ];
@@ -35,6 +38,71 @@ const VOICE_PROVIDERS = [
       { value: 'whisper-1', label: 'Whisper (whisper-1)' },
       { value: 'gpt-4o-mini-transcribe', label: 'GPT-4o mini transcribe' },
       { value: 'gpt-4o-transcribe', label: 'GPT-4o transcribe — most accurate' },
+    ],
+  },
+];
+
+// Text-to-speech providers for spoken replies (Web Call). The voice list is
+// per-model. Groq's Orpheus Arabic-Saudi model requires a one-time terms
+// acceptance in the Groq console before it returns audio.
+const TTS_PROVIDERS = [
+  {
+    value: 'groq',
+    label: 'Groq (Orpheus)',
+    models: [
+      {
+        value: 'canopylabs/orpheus-arabic-saudi',
+        label: 'Orpheus Arabic (Saudi/Gulf) — natural Arabic',
+        voices: ['aisha', 'noura', 'lulwa', 'abdullah', 'fahad', 'sultan'],
+      },
+      {
+        value: 'canopylabs/orpheus-v1-english',
+        label: 'Orpheus English',
+        voices: ['hannah', 'autumn', 'diana', 'austin', 'daniel', 'troy'],
+      },
+    ],
+  },
+  {
+    value: 'openai',
+    label: 'OpenAI',
+    models: [
+      { value: 'tts-1', label: 'TTS-1', voices: ['alloy', 'nova', 'shimmer', 'echo', 'fable', 'onyx'] },
+      { value: 'gpt-4o-mini-tts', label: 'GPT-4o mini TTS', voices: ['alloy', 'nova', 'shimmer', 'echo', 'fable', 'onyx'] },
+    ],
+  },
+  {
+    // Azure AI Speech — locale-specific neural voices (incl. UAE Arabic) with
+    // SSML control. Uses the `azure_speech` key (separate from Azure OpenAI) +
+    // a region (the field below). The "model" entries just group voices by language.
+    value: 'azure_speech',
+    label: 'Microsoft Azure (Speech)',
+    models: [
+      { value: 'arabic', label: 'Arabic (neural)', voices: ['ar-AE-FatimaNeural', 'ar-AE-HamdanNeural', 'ar-SA-ZariyahNeural', 'ar-SA-HamedNeural', 'ar-EG-SalmaNeural'] },
+      { value: 'english', label: 'English (neural)', voices: ['en-US-JennyNeural', 'en-US-AriaNeural', 'en-GB-SoniaNeural', 'en-GB-RyanNeural'] },
+    ],
+  },
+  {
+    // ElevenLabs — most expressive multilingual TTS (incl. Arabic). Voices are
+    // account/library-specific IDs, so the voice field is a free-text input.
+    value: 'elevenlabs',
+    label: 'ElevenLabs (multilingual)',
+    models: [
+      { value: 'eleven_multilingual_v2', label: 'Multilingual v2 — best quality', voices: [] },
+      { value: 'eleven_turbo_v2_5', label: 'Turbo v2.5 — fast', voices: [] },
+      { value: 'eleven_flash_v2_5', label: 'Flash v2.5 — fastest', voices: [] },
+    ],
+  },
+  {
+    // AI/ML API — ElevenLabs voices via aimlapi.com credits (no paid ElevenLabs
+    // plan needed). Voices are by name; multilingual (speak Arabic, non-native accent).
+    value: 'aimlapi',
+    label: 'AI/ML API (ElevenLabs)',
+    models: [
+      {
+        value: 'elevenlabs/eleven_turbo_v2_5',
+        label: 'ElevenLabs Turbo v2.5 — multilingual',
+        voices: ['Sarah', 'Aria', 'Charlotte', 'Alice', 'Matilda', 'Jessica', 'Grace', 'Lily', 'Serena', 'Nicole', 'Rachel', 'Emily', 'Dorothy', 'Freya', 'Laura', 'George', 'Charlie', 'Liam', 'Daniel', 'Brian', 'Will', 'Chris', 'Eric'],
+      },
     ],
   },
 ];
@@ -510,23 +578,6 @@ export default function Settings() {
           </div>
         )}
 
-        {/* Token Budgets */}
-        {config?.context?.budgets && (
-          <div className="card">
-            <div className="card-header">Token Budgets</div>
-            <div className="card-body">
-              <div className="status-list">
-                {Object.entries(config.context.budgets).map(([k, v]) => (
-                  <div key={k} className="status-item">
-                    <span className="status-label">{k}</span>
-                    <span>{v.toLocaleString()} tokens</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </div>
-        )}
-
         {/* Appearance */}
         <div className="card">
           <div className="card-header">Appearance</div>
@@ -652,6 +703,15 @@ function VoiceMessagesCard({ config, api, configuredProviders, onSaved }) {
   const [saving, setSaving] = useState(false);
   const [msg, setMsg] = useState('');
 
+  // Web Call (spoken replies via TTS).
+  const [webcallEnabled, setWebcallEnabled] = useState(false);
+  const [ttsProvider, setTtsProvider] = useState('groq');
+  const [ttsModel, setTtsModel] = useState('');
+  const [ttsVoice, setTtsVoice] = useState('');
+  const [ttsRegion, setTtsRegion] = useState(''); // Azure region (e.g. "uaenorth")
+  const [ttsRate, setTtsRate] = useState('');     // Azure SSML rate (e.g. "+6%")
+  const [ttsPitch, setTtsPitch] = useState('');   // Azure SSML pitch (e.g. "+3%")
+
   // Inline API key entry (only shown when the chosen provider has no key).
   const [apiKey, setApiKey] = useState('');
   const [savingKey, setSavingKey] = useState(false);
@@ -668,7 +728,35 @@ function VoiceMessagesCard({ config, api, configuredProviders, onSaved }) {
     setProvider(prov);
     const provModels = (VOICE_PROVIDERS.find(p => p.value === prov)?.models) || [];
     setModel(v.model || provModels[0]?.value || '');
+
+    const t = v.tts || {};
+    setWebcallEnabled(!!v.webcall_enabled);
+    const tProv = t.provider || 'groq';
+    setTtsProvider(tProv);
+    const tModels = (TTS_PROVIDERS.find(p => p.value === tProv)?.models) || [];
+    const tModel = t.model || tModels[0]?.value || '';
+    setTtsModel(tModel);
+    const tVoices = (tModels.find(m => m.value === tModel)?.voices) || [];
+    setTtsVoice(t.voice || tVoices[0] || '');
+    setTtsRegion(t.region || '');
+    setTtsRate(t.rate || '');
+    setTtsPitch(t.pitch || '');
   }, [config]);
+
+  const changeTtsProvider = (val) => {
+    setTtsProvider(val);
+    const tModels = (TTS_PROVIDERS.find(p => p.value === val)?.models) || [];
+    const m = tModels[0]?.value || '';
+    setTtsModel(m);
+    setTtsVoice((tModels[0]?.voices || [])[0] || '');
+  };
+  const changeTtsModel = (val) => {
+    setTtsModel(val);
+    const tModels = (TTS_PROVIDERS.find(p => p.value === ttsProvider)?.models) || [];
+    setTtsVoice((tModels.find(m => m.value === val)?.voices || [])[0] || '');
+  };
+  const ttsModels = (TTS_PROVIDERS.find(p => p.value === ttsProvider)?.models) || [];
+  const ttsVoices = (ttsModels.find(m => m.value === ttsModel)?.voices) || [];
 
   const changeProvider = (val) => {
     setProvider(val);
@@ -704,7 +792,19 @@ function VoiceMessagesCard({ config, api, configuredProviders, onSaved }) {
         setApiKey('');
       }
       await api.put('/api/config', {
-        voice: { enabled, provider, model: model || defaultModel },
+        voice: {
+          enabled, provider, model: model || defaultModel,
+          webcall_enabled: webcallEnabled,
+          // Preserve an optional second-language (e.g. English) fallback voice
+          // configured outside this form, so saving the main voice doesn't wipe it.
+          tts: {
+            provider: ttsProvider, model: ttsModel, voice: ttsVoice,
+            ...(ttsRegion ? { region: ttsRegion } : {}),
+            ...(ttsRate ? { rate: ttsRate } : {}),
+            ...(ttsPitch ? { pitch: ttsPitch } : {}),
+            ...(config?.voice?.tts?.en ? { en: config.voice.tts.en } : {}),
+          },
+        },
       });
       setMsg('Saved!');
       onSaved?.();
@@ -773,6 +873,77 @@ function VoiceMessagesCard({ config, api, configuredProviders, onSaved }) {
                 )}
               </div>
             )}
+          </>
+        )}
+
+        <div style={{ borderTop: '1px solid var(--border)', margin: '16px 0' }} />
+
+        <p className="form-hint" style={{ marginTop: 0 }}>
+          <strong>Voice Call</strong> — let callers talk to your agent by voice (website, app,
+          or any client). Turn this on so the agent replies out loud in the voice you pick
+          below. Pair it with the <strong>Voice Call</strong> card in the Deploy tab.
+        </p>
+
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', marginBottom: 12 }}>
+          <input type="checkbox" checked={webcallEnabled} onChange={e => setWebcallEnabled(e.target.checked)} />
+          <span>Reply to customers out loud</span>
+        </label>
+
+        {webcallEnabled && (
+          <>
+            <div className="form-group">
+              <label>Voice service</label>
+              <select className="form-select" value={ttsProvider} onChange={e => changeTtsProvider(e.target.value)}>
+                {TTS_PROVIDERS.map(p => <option key={p.value} value={p.value}>{p.label}</option>)}
+              </select>
+            </div>
+            <div className="form-group">
+              <label>Voice model</label>
+              <select className="form-select" value={ttsModel} onChange={e => changeTtsModel(e.target.value)}>
+                {ttsModels.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
+              </select>
+            </div>
+            <div className="form-group">
+              <label>Voice</label>
+              {ttsProvider === 'elevenlabs' ? (
+                <input className="form-input" value={ttsVoice} onChange={e => setTtsVoice(e.target.value)} placeholder="ElevenLabs voice ID (from your Voice Library)" />
+              ) : (
+                <select className="form-select" value={ttsVoice} onChange={e => setTtsVoice(e.target.value)}>
+                  {ttsVoices.map(v => <option key={v} value={v}>{v}</option>)}
+                </select>
+              )}
+            </div>
+            {ttsProvider === 'azure_speech' && (
+              <>
+                <div className="form-group">
+                  <label>Azure region</label>
+                  <input className="form-input" value={ttsRegion} onChange={e => setTtsRegion(e.target.value)} placeholder="e.g. uaenorth" />
+                  <p className="form-hint">The region of your Azure Speech resource (e.g. <code>uaenorth</code>, <code>eastus</code>). Add the Azure key under <strong>Configured Providers</strong> above.</p>
+                </div>
+                <div className="form-group" style={{ display: 'flex', gap: 12 }}>
+                  <div style={{ flex: 1 }}>
+                    <label>Speed</label>
+                    <input className="form-input" value={ttsRate} onChange={e => setTtsRate(e.target.value)} placeholder="e.g. +6%" />
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <label>Pitch</label>
+                    <input className="form-input" value={ttsPitch} onChange={e => setTtsPitch(e.target.value)} placeholder="e.g. +3%" />
+                  </div>
+                </div>
+                <p className="form-hint">Tune how the voice sounds. Use a signed percent like <code>+6%</code> / <code>-5%</code>. A slightly higher speed and pitch usually sounds livelier and less robotic; leave blank for the default. (Listen, adjust, save, restart.)</p>
+              </>
+            )}
+            <p className="form-hint">
+              {ttsProvider === 'groq'
+                ? "Uses the same API key as transcription above. Groq's Orpheus voices need a one-time terms acceptance in the Groq console before they work."
+                : ttsProvider === 'azure_speech'
+                  ? 'Azure neural voices support locale-specific accents (e.g. ar-AE Emirati) and longer replies. Needs an Azure key + region.'
+                  : ttsProvider === 'elevenlabs'
+                    ? 'ElevenLabs is the most expressive option and speaks Arabic via the multilingual model. For a native accent, add an Arabic voice from the ElevenLabs Voice Library and paste its voice ID above. Needs an ElevenLabs API key.'
+                    : ttsProvider === 'aimlapi'
+                      ? 'ElevenLabs voices billed against your AI/ML API (aimlapi.com) credits — no paid ElevenLabs plan needed. Voices are multilingual (they speak Arabic with a non-native accent). Needs an AI/ML API key.'
+                      : 'Uses the API key configured for this provider.'}
+            </p>
           </>
         )}
 

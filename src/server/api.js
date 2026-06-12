@@ -1352,7 +1352,7 @@ export function apiRouter(workspace) {
 
   router.post('/connections/:platform', conditionalPhotoUpload, async (req, res) => {
     const { platform } = req.params;
-    const validPlatforms = ['truuze', 'http', 'openclaw', 'telegram', 'discord', 'slack', 'whatsapp', 'telnyx', 'relay'];
+    const validPlatforms = ['truuze', 'http', 'openclaw', 'telegram', 'discord', 'slack', 'whatsapp', 'telnyx', 'webcall', 'relay'];
     if (!validPlatforms.includes(platform)) {
       return res.status(400).json({ error: `Invalid platform. Use: ${validPlatforms.join(', ')}` });
     }
@@ -1679,6 +1679,36 @@ export function apiRouter(workspace) {
             platform: 'telnyx', mode: 'direct', apiKey: secret, model, port,
             publicUrl,
             baseUrl: `${publicUrl || `http://localhost:${port}`}/v1`,
+            connectedAt: new Date().toISOString(),
+          });
+        }
+      } else if (platform === 'webcall') {
+        // Web Call (browser voice). Audio-in/audio-out; the agent does STT/TTS
+        // on its own Groq key, so there's no secret. Public per-slug like the
+        // chat widget. Relay mode → enable on streetai; else direct (local).
+        const relayConn = loadConnection(workspace, 'relay');
+        if (relayConn?.slug && relayConn?.relayKey) {
+          const relayBase = 'https://streetai.org';
+          const r = await fetch(`${relayBase}/relay/configure`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ slug: relayConn.slug, relayKey: relayConn.relayKey, webcall: { enabled: true } }),
+          });
+          if (!r.ok) {
+            const e = await r.json().catch(() => ({}));
+            return res.status(400).json({ error: e.error || 'Relay configure failed' });
+          }
+          saveConnection(workspace, 'webcall', {
+            platform: 'webcall', mode: 'relay', slug: relayConn.slug,
+            baseUrl: `${relayBase}/webcall/${relayConn.slug}/turn`,
+            connectedAt: new Date().toISOString(),
+          });
+        } else {
+          const port = parseInt(req.body.port) || 3303;
+          const publicUrl = (req.body.publicUrl || '').trim().replace(/\/$/, '');
+          saveConnection(workspace, 'webcall', {
+            platform: 'webcall', mode: 'direct', port, publicUrl,
+            baseUrl: `${publicUrl || `http://localhost:${port}`}/webcall/turn`,
             connectedAt: new Date().toISOString(),
           });
         }

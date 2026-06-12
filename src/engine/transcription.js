@@ -30,15 +30,21 @@ export function sttDefaultModel(provider) {
 /**
  * Transcribe an audio file to text.
  *
+ * Provide EITHER `filePath` (read from disk — used by the voice-note path) OR
+ * `buffer` + `filename` (in-memory — used by the Web Call path so we don't
+ * write a temp file per turn).
+ *
  * @param {object} opts
- * @param {string} opts.filePath  Absolute path to the audio file.
+ * @param {string} [opts.filePath]  Absolute path to the audio file.
+ * @param {Buffer} [opts.buffer]    In-memory audio bytes (alternative to filePath).
+ * @param {string} [opts.filename]  Filename hint for the buffer (extension matters).
  * @param {string} opts.provider  Credential/provider name (e.g. 'groq', 'openai').
  * @param {string} [opts.model]   Override model; falls back to the provider default.
  * @param {string} [opts.language] Optional ISO-639-1 hint (e.g. 'en'); omit to auto-detect.
  * @param {string} [opts.endpoint] Override URL for a custom OpenAI-compatible host.
  * @returns {Promise<string>} The transcript (may be empty if speech wasn't detected).
  */
-export async function transcribeAudio({ filePath, provider = 'groq', model, language, endpoint } = {}) {
+export async function transcribeAudio({ filePath, buffer: inputBuffer, filename, provider = 'groq', model, language, endpoint } = {}) {
   const spec = STT_PROVIDERS[provider];
   const url = endpoint || spec?.url;
   if (!url) throw new Error(`Unknown transcription provider "${provider}" and no endpoint given.`);
@@ -47,16 +53,25 @@ export async function transcribeAudio({ filePath, provider = 'groq', model, lang
   if (!cred?.apiKey) {
     throw new Error(`No API key for "${provider}". Add it in Settings → Add API Key.`);
   }
-  if (!fs.existsSync(filePath)) throw new Error(`Audio file not found: ${filePath}`);
 
-  const stat = fs.statSync(filePath);
-  if (stat.size > MAX_AUDIO_BYTES) {
-    throw new Error(`Audio file is too large (${Math.round(stat.size / 1048576)} MB).`);
+  // Resolve the audio bytes from either an in-memory buffer or a file on disk.
+  let buffer, name;
+  if (inputBuffer) {
+    buffer = inputBuffer;
+    name = filename || 'audio.webm';
+  } else {
+    if (!filePath) throw new Error('transcribeAudio requires either filePath or buffer.');
+    if (!fs.existsSync(filePath)) throw new Error(`Audio file not found: ${filePath}`);
+    buffer = fs.readFileSync(filePath);
+    name = path.basename(filePath);
   }
 
-  const buffer = fs.readFileSync(filePath);
+  if (buffer.length > MAX_AUDIO_BYTES) {
+    throw new Error(`Audio is too large (${Math.round(buffer.length / 1048576)} MB).`);
+  }
+
   const form = new FormData();
-  form.append('file', new Blob([buffer]), path.basename(filePath));
+  form.append('file', new Blob([buffer]), name);
   form.append('model', model || spec?.defaultModel || 'whisper-1');
   form.append('response_format', 'json');
   if (language) form.append('language', language);

@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { useApi } from '../hooks/useApi.js';
 import { SiTelegram, SiWhatsapp, SiDiscord, SiSlack } from 'react-icons/si';
 import { HiGlobeAlt, HiCommandLine } from 'react-icons/hi2';
-import { TbRelationManyToMany, TbPhone } from 'react-icons/tb';
+import { TbRelationManyToMany, TbPhone, TbMicrophone } from 'react-icons/tb';
 import truuzeIcon from '../assets/truuze-icon.png';
 import openclawIcon from '../assets/openclaw-icon.png';
 
@@ -13,6 +13,7 @@ const PLATFORM_ICONS = {
   telegram: { Icon: SiTelegram, color: '#29a9eb' },
   whatsapp: { Icon: SiWhatsapp, color: '#25d366' },
   telnyx:   { Icon: TbPhone, color: '#00c389' },
+  webcall:  { Icon: TbMicrophone, color: '#0ea5e9' },
   discord:  { Icon: SiDiscord, color: '#5865f2' },
   slack:    { Icon: SiSlack, color: '#e01e5a' },
   relay:    { Icon: TbRelationManyToMany, color: '#8b5cf6' },
@@ -25,6 +26,7 @@ const PLATFORM_META = {
   telegram: { label: 'Telegram',  color: '#29a9eb', desc: 'Telegram bot integration', supported: true, help: 'Connect a Telegram bot so users can chat with your agent directly in Telegram. Requires a bot token from @BotFather.' },
   whatsapp: { label: 'WhatsApp',  color: '#25d366', desc: 'WhatsApp Business API', supported: true, help: 'Connect to WhatsApp Business API so customers can message your agent via WhatsApp. Requires Meta Business credentials.' },
   telnyx:   { label: 'Phone (Telnyx)', color: '#00c389', desc: 'Voice calls — take orders & bookings by phone', supported: true, help: 'Telnyx runs the phone call (speech to text and back); your agent is the brain. Best with the Public Link (Relay) so no public server is needed. Requires a Telnyx Voice AI Assistant and a phone number.' },
+  webcall:  { label: 'Voice Call',  color: '#0ea5e9', desc: 'Talk to your agent by voice — website, app, or any client', supported: true, help: 'Callers talk to your agent by voice — from a website, a mobile app, or any client that sends audio. The agent turns speech into text and its reply back into speech using your own Groq key (set under Settings → Voice). Best with the Public Link (Relay) so no public server is needed.' },
   discord:  { label: 'Discord',   color: '#5865f2', desc: 'Discord bot integration', supported: true, help: 'Add your agent as a Discord bot that can respond to messages in your server channels.' },
   slack:    { label: 'Slack',     color: '#e01e5a', desc: 'Slack app integration', supported: true, help: 'Install your agent as a Slack app that can respond to messages in your workspace channels.' },
   http:     { label: 'HTTP API',  color: '#10b981', desc: 'REST API + chat widget (requires public server)', supported: true, help: 'Run a local REST API on your machine. Best for development or when you have a server with a public IP. Includes an embeddable chat widget.' },
@@ -112,6 +114,10 @@ export default function Deploy() {
   const [telnyxPublicUrl, setTelnyxPublicUrl] = useState('');
   const [telnyxPort, setTelnyxPort] = useState('3302');
   const [telnyxResult, setTelnyxResult] = useState(null);
+  // Web Call form
+  const [webcallPublicUrl, setWebcallPublicUrl] = useState('');
+  const [webcallPort, setWebcallPort] = useState('3303');
+  const [webcallResult, setWebcallResult] = useState(null);
   // Owner verification
   const [verifyPending, setVerifyPending] = useState([]);
 
@@ -297,6 +303,9 @@ export default function Deploy() {
         if (telnyxModel.trim()) body.model = telnyxModel.trim();
         if (telnyxPublicUrl.trim()) body.publicUrl = telnyxPublicUrl.trim();
         if (telnyxPort.trim()) body.port = parseInt(telnyxPort) || 3302;
+      } else if (platform === 'webcall') {
+        if (webcallPublicUrl.trim()) body.publicUrl = webcallPublicUrl.trim();
+        if (webcallPort.trim()) body.port = parseInt(webcallPort) || 3303;
       }
       const result = await api.post(`/api/connections/${platform}`, body);
       if (platform === 'relay' && result?.connections) {
@@ -307,6 +316,9 @@ export default function Deploy() {
       } else if (platform === 'telnyx' && result?.connections) {
         const tc = result.connections.find(c => c.platform === 'telnyx');
         if (tc?.config) setTelnyxResult(tc.config);
+      } else if (platform === 'webcall' && result?.connections) {
+        const wc = result.connections.find(c => c.platform === 'webcall');
+        if (wc?.config) setWebcallResult(wc.config);
       } else {
         setShowForm(null);
       }
@@ -348,6 +360,20 @@ export default function Deploy() {
       await load();
     } catch (err) { alert('Failed to stop: ' + err.message); }
     setActing(null);
+  };
+
+  // Connectors that produce URLs/instructions on connect. "View URLs" re-opens
+  // that connector's form showing the details, pulled from the saved connection
+  // config (which carries slug/baseUrl/apiKey/model), so users can retrieve them
+  // any time — not just in the moment right after connecting.
+  const URL_CONNECTORS = ['relay', 'telnyx', 'webcall'];
+  const viewUrls = (platform, config) => {
+    if (platform === 'relay') setRelayResult(config);
+    else if (platform === 'telnyx') setTelnyxResult(config);
+    else if (platform === 'webcall') setWebcallResult(config);
+    else return;
+    setShowForm(platform);
+    setTimeout(() => formRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100);
   };
 
   const toggleAutoStart = async (platform, enabled) => {
@@ -674,12 +700,8 @@ export default function Deploy() {
                       {isActing ? 'Starting...' : 'Start'}
                     </button>
                   )}
-                  {platform === 'relay' && config.slug && (
-                    <button className="btn btn-sm" onClick={() => {
-                      setRelayResult(config);
-                      setShowForm('relay');
-                      setTimeout(() => formRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100);
-                    }}>View URLs</button>
+                  {URL_CONNECTORS.includes(platform) && (config.slug || config.baseUrl) && (
+                    <button className="btn btn-sm" onClick={() => viewUrls(platform, config)}>View URLs</button>
                   )}
                   {!isCli && !isRunning && (
                     <button className="btn btn-danger" onClick={() => setDisconnectConfirm(platform)} disabled={isActing}>Disconnect</button>
@@ -712,6 +734,12 @@ export default function Deploy() {
                       setShowForm(platform);
                       setFormMsg('');
                       setTruuzeMode('new');
+                      // Clear any stale result from a previous connect so the form
+                      // opens fresh (e.g. after disconnect → Connect again, the old
+                      // relay/telnyx/webcall URL + instructions must not reappear).
+                      setRelayResult(null);
+                      setTelnyxResult(null);
+                      setWebcallResult(null);
                       setTimeout(() => formRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100);
                     }}>Connect</button>
                   ) : (
@@ -1245,6 +1273,52 @@ Content-Type: application/json
               <p style={{ margin: '0' }}><strong>8.</strong> Call the number to test. To support multiple languages, use a router assistant that hands off to one assistant per language — all pointing at the same Base URL.</p>
             </div>
             <p className="form-hint" style={{ marginTop: 10 }}>The phone number, DNCR registration, and assistant settings live in Telnyx and can't be configured from this dashboard.</p>
+          </div>
+        </div>
+      )}
+
+      {showForm === 'webcall' && (
+        <div ref={formRef} className="card deploy-form-card">
+          <div className="card-header" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+            <span>Connect Voice Call</span>
+            <button className="btn btn-sm" onClick={() => { setShowForm(null); setWebcallResult(null); }}>Cancel</button>
+          </div>
+          <div className="card-body">
+            <p className="form-hint" style={{ marginBottom: 12 }}>Callers talk to your agent by voice — from a website, a mobile app, or any client that sends audio. The agent turns their speech into text and its reply back into speech, using your own Groq key. No phone number or telephony provider needed.</p>
+
+            {!webcallResult ? (
+              <>
+                <div className="form-group">
+                  <label>Public URL <span style={{ color: 'var(--text-muted)' }}>(direct mode only)</span></label>
+                  <input type="text" value={webcallPublicUrl} onChange={e => setWebcallPublicUrl(e.target.value)} className="form-input" placeholder="https://your-tunnel.trycloudflare.com" />
+                  <p className="form-hint">Only used if the Public Link (Relay) is NOT connected. With the Relay connected, leave this blank.</p>
+                </div>
+                <div className="form-group">
+                  <label>Port <span style={{ color: 'var(--text-muted)' }}>(direct mode only)</span></label>
+                  <input type="number" value={webcallPort} onChange={e => setWebcallPort(e.target.value)} className="form-input" />
+                  <p className="form-hint">Local port the voice endpoint listens on. Ignored when using the Relay.</p>
+                </div>
+                <div className="form-actions">
+                  <button className="btn btn-primary" onClick={() => connect('webcall')} disabled={saving}>{saving ? 'Connecting...' : 'Connect'}</button>
+                </div>
+                {formMsg && <p className="form-hint" style={{ color: 'var(--red)', marginTop: 8 }}>{formMsg}</p>}
+              </>
+            ) : (
+              <div style={{ padding: '14px 16px', background: 'rgba(16, 185, 129, 0.08)', border: '1px solid rgba(16, 185, 129, 0.2)', borderRadius: 8, marginBottom: 16 }}>
+                <p style={{ margin: '0 0 10px', fontSize: 13, color: '#10b981', fontWeight: 600 }}>Connected ({webcallResult.mode} mode). Your Voice Call endpoint:</p>
+                <pre className="deploy-code-block" style={{ margin: 0 }}>{webcallResult.baseUrl}</pre>
+              </div>
+            )}
+
+            <div className="deploy-form-divider" />
+            <h4 style={{ margin: '0 0 8px', fontSize: 13, color: 'var(--text)' }}>Setup checklist</h4>
+            <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.7 }}>
+              <p style={{ margin: '0 0 6px' }}><strong>1.</strong> Connect <strong>Public Link (Relay)</strong> first (recommended — no public server needed).</p>
+              <p style={{ margin: '0 0 6px' }}><strong>2.</strong> Under <strong>Settings → Voice</strong>, add your <strong>Groq</strong> key and enable <strong>text-to-speech</strong> (and pick a voice). The agent needs this to speak.</p>
+              <p style={{ margin: '0 0 6px' }}><strong>3.</strong> Click <strong>Connect</strong> above to enable Voice Call and get your endpoint URL.</p>
+              <p style={{ margin: '0' }}><strong>4.</strong> Make sure the agent is running and <strong>online</strong> (Start on the Relay card). Callers can only reach it while it's online.</p>
+            </div>
+            <p className="form-hint" style={{ marginTop: 10 }}>Speech runs on your own Groq key — StreetAI just passes the audio through and never stores it.</p>
           </div>
         </div>
       )}

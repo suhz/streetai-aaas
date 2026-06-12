@@ -5,7 +5,7 @@
 
 const DEFAULT_BUDGETS = {
   base: 4000,
-  system: 5000,
+  system: 16000,
   platformSkill: 16000,
   session: 16000,
   memory: 2000,
@@ -36,9 +36,12 @@ export class ContextAssembler {
    * @param {string} params.event - Current user message/event
    * @param {string} params.agentName - Agent name for system prompt
    * @param {Array} params.platformContext - Extra context about the platform/event type
+   * @param {string} [params.replyLanguage] - Optional per-turn language lock ('ar'|'en').
+   *   When set, a just-in-time directive is injected right before the user message
+   *   forcing the reply into that language. Absent → no change (default behavior).
    * @returns {{ messages: Array, estimatedTokens: number }}
    */
-  assemble({ basePrompt, skill, platformSkill, soul, sessionMessages = [], sessionSummary, memoryFacts = [], event, agentName, platformContext }) {
+  assemble({ basePrompt, skill, platformSkill, soul, sessionMessages = [], sessionSummary, memoryFacts = [], event, agentName, platformContext, replyLanguage }) {
     const messages = [];
     let totalTokens = 0;
 
@@ -106,6 +109,18 @@ export class ContextAssembler {
     for (const msg of recentMessages) {
       messages.push(msg);
       totalTokens += estimateTokens(typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content));
+    }
+
+    // Layer 4b: Per-turn language lock (just-in-time, highest salience). Only
+    // when a caller-language was resolved (currently the voice path). This is the
+    // last instruction before the user message, so it overrides any example /
+    // template language baked into the SKILL above.
+    const LANG_NAMES = { ar: 'Arabic', en: 'English' };
+    if (LANG_NAMES[replyLanguage]) {
+      const langName = LANG_NAMES[replyLanguage];
+      const directive = `IMPORTANT — for THIS reply only: the caller's most recent message is in ${langName}. Respond ENTIRELY in ${langName}, including any read-back or booking confirmation. Do not switch or mix languages. This overrides the language of any example or template in the instructions above.`;
+      messages.push({ role: 'system', content: directive });
+      totalTokens += estimateTokens(directive);
     }
 
     // Layer 5: Current event

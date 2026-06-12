@@ -50,8 +50,8 @@ export default class TelnyxConnector extends BaseConnector {
       }
 
       const body = req.body || {};
-      const { userId, content, language } = extractTelnyxEvent(body);
-      const text = await runVoiceTurn(this.engine, { userId, content, language });
+      const { userId, content, language, isGreeting } = extractTelnyxEvent(body);
+      const text = await runVoiceTurn(this.engine, { userId, content, language, isGreeting });
 
       if (body.stream) {
         writeOpenAISSE(res, text, this.model);
@@ -124,6 +124,11 @@ export default class TelnyxConnector extends BaseConnector {
  *   crashes — it just starts a fresh session.
  * - content ← the last user message (string or OpenAI content-parts array).
  * - language ← optional extra_metadata.language (for per-language assistants).
+ * - isGreeting ← true when the call just started and the assistant is expected
+ *   to speak first ("model-generated greeting"): no user message yet AND no
+ *   prior assistant turn. Lets the caller wire an opening line instead of the
+ *   empty-input fallback. A mid-call empty turn (assistant already spoke) is
+ *   NOT a greeting — it keeps the normal "didn't catch that" fallback.
  */
 export function extractTelnyxEvent(body) {
   const meta = (body && body.extra_metadata) || {};
@@ -143,23 +148,74 @@ export function extractTelnyxEvent(body) {
     }
   }
 
-  return { userId, content, language: meta.language || null };
+  const hasAssistant = messages.some((m) => m?.role === 'assistant');
+  const isGreeting = !content.trim() && !hasAssistant;
+
+  return { userId, content, language: meta.language || null, isGreeting };
+}
+
+// Per-turn language lock for voice. The reply must follow the language of the
+// caller's latest words — small/fast models otherwise copy a SKILL template's
+// language (e.g. an Arabic confirmation) even mid-English call. We detect the
+// script deterministically and pass it to the engine, which injects a
+// just-in-time directive. Arabic vs Latin only (Arabic/English); good for voice
+// where STT yields native script.
+//
+// Only lock when THIS message is unambiguously Arabic or English. If it's
+// neither (digits/punctuation/empty, another script, or a roughly balanced
+// Arabic+English mix), we return undefined and the engine does nothing —
+// falling back to the original behavior of letting the agent decide. No
+// carry-forward, no guessing.
+const ARABIC_G = /[؀-ۿݐ-ݿࢠ-ࣿﭐ-﷿ﹰ-﻿]/g;
+const LATIN_G = /[A-Za-z]/g;
+const DOMINANT = 0.7; // one script must be ≥70% of the letters to lock that language
+
+/** Detect 'ar' | 'en' from text; undefined when not clearly either (→ agent decides). */
+function detectLang(text) {
+  const s = String(text || '');
+  const ar = (s.match(ARABIC_G) || []).length;
+  const la = (s.match(LATIN_G) || []).length;
+  if (!ar && !la) return undefined;          // no letters → agent decides
+  if (ar && !la) return 'ar';                 // pure Arabic
+  if (la && !ar) return 'en';                 // pure Latin/English
+  // Both scripts present (e.g. Arabic sentence with an English brand word, or
+  // genuine code-switching). Lock only if one clearly dominates; otherwise the
+  // message is genuinely mixed → let the agent decide.
+  const total = ar + la;
+  if (ar / total >= DOMINANT) return 'ar';
+  if (la / total >= DOMINANT) return 'en';
+  return undefined;
 }
 
 /**
  * Run one voice turn through the engine and sanitise the reply for speech.
  * Shared shape used by the direct connector; the relay client mirrors this
  * inline so it can `_respond` over the WebSocket.
+ *
+ * On the greeting turn (`isGreeting`, no caller words yet) we feed the agent a
+ * greeting trigger so it speaks its own opening line — instead of returning the
+ * empty-input fallback. The trigger is configurable per agent via
+ * `config.voice.greeting` (or `config.greeting`); defaults to "Hello", which the
+ * agent's own SKILL turns into its branded/localized greeting.
  */
-export async function runVoiceTurn(engine, { userId, content, language }) {
+export async function runVoiceTurn(engine, { userId, content, language, isGreeting }) {
   try {
+    let greeting = false;
+    if (!String(content || '').trim() && isGreeting) {
+      const cfg = engine?.config || {};
+      content = (cfg.voice && cfg.voice.greeting) || cfg.greeting || 'Hello';
+      greeting = true;
+    }
+    // Lock the reply only when this message is clearly Arabic or English;
+    // otherwise leave it to the agent (replyLanguage stays undefined).
+    const replyLanguage = detectLang(content);
     const result = await engine.processEvent({
       platform: 'telnyx',
       userId,
       userName: userId,
       type: 'message',
       content,
-      metadata: { mode: 'customer', channel: 'voice', language },
+      metadata: { mode: 'customer', channel: 'voice', language, greeting, replyLanguage },
     });
     let text = result.response || '';
     const workspace = engine?.workspace;

@@ -28,6 +28,7 @@ import {
 } from './commands/hub.js';
 import { exportCommand } from './commands/export.js';
 import { importCommand } from './commands/import.js';
+import { updateCommand } from './commands/update.js';
 import { publishCommand } from './commands/publish.js';
 
 const program = new Command();
@@ -108,6 +109,11 @@ data
   .command('import <source> [rename-to]')
   .description('Copy an external file into data/ (optionally rename it)')
   .action((source, renameTo) => dataCommand('import', source, renameTo));
+
+data
+  .command('sync [name]')
+  .description('Sync configured data sources now (.aaas/data-sources.json)')
+  .action((name) => dataCommand('sync', name));
 
 const txn = program
   .command('transactions')
@@ -387,6 +393,15 @@ program
   .argument('[target-dir]', 'Folder to restore into (default: workspace name from the bundle)')
   .option('--force', 'Allow overwriting an existing non-empty target folder')
   .action(importCommand);
+
+program
+  .command('update <source>')
+  .description('Update an installed workspace from a bundle (URL or file), preserving sessions, data, and credentials')
+  .option('-n, --name <agent>', 'Target agent by registered name (default: from the bundle)')
+  .option('-w, --workspace <dir>', 'Target workspace folder explicitly')
+  .option('--no-backup', 'Do not back up changed files to .aaas/backups/')
+  .option('--dry-run', 'Show what would change without writing anything')
+  .action(updateCommand);
 
 program
   .command('publish [agent-name]')

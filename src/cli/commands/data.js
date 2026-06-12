@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import chalk from 'chalk';
 import { requireWorkspace, getWorkspacePaths, listFiles, readJson, writeJson, fileStats, formatBytes } from '../../utils/workspace.js';
+import { syncDueDataSources } from '../../datasync/index.js';
 
 export function dataCommand(action, arg, extra) {
   const ws = requireWorkspace();
@@ -15,7 +16,23 @@ export function dataCommand(action, arg, extra) {
     case 'add': return dataAdd(paths, arg);
     case 'remove': return dataRemove(paths, arg, extra);
     case 'import': return dataImport(paths, arg, extra);
+    case 'sync': return dataSync(ws, arg);
   }
+}
+
+async function dataSync(ws, name) {
+  console.log(chalk.blue('\n  Syncing data sources...\n'));
+  const results = await syncDueDataSources(ws, { force: true, only: name || null });
+  if (!results.length) {
+    console.log(chalk.gray('  No data sources configured. Add them to .aaas/data-sources.json\n'));
+    return;
+  }
+  for (const r of results) {
+    if (r.synced) console.log(chalk.green(`  ✓ ${r.name}: ${r.rows} rows → ${r.target}`));
+    else if (r.skipped) console.log(chalk.gray(`  – ${r.name}: skipped (${r.reason})`));
+    else console.log(chalk.red(`  ✗ ${r.name}: ${r.error}`));
+  }
+  console.log('');
 }
 
 function dataImport(paths, src, renameTo) {

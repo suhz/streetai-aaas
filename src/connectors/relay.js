@@ -7,6 +7,7 @@ import { loadConnection } from '../auth/connections.js';
 import { writePlatformSkill, readJson } from '../utils/workspace.js';
 import { formatForWhatsApp } from './whatsapp.js';
 import { extractTelnyxEvent, runVoiceTurn } from './telnyx.js';
+import { runWebcallTurn } from './webcall.js';
 import { applyTxnButtonAction } from './transaction-actions.js';
 import { renderTransactionCard } from '../notifications/transaction-card.js';
 import { flushPendingWhatsApp, isTransactionActor } from '../notifications/index.js';
@@ -192,6 +193,34 @@ Bad (will NOT work):
       await this._handleTelnyxChat(data);
       return;
     }
+
+    if (data.type === 'webcall:audio') {
+      await this._handleWebcallAudio(data);
+      return;
+    }
+  }
+
+  // ─── Web Call voice handling ─────────────────────────────────
+  // streetai.org forwards the browser's audio here; the agent does STT → brain
+  // → TTS (on the operator's own Groq key) and returns audio. streetai just
+  // pipes it back to the browser — it never touches speech keys.
+  async _handleWebcallAudio(data) {
+    const p = data.payload || {};
+    let audioBuffer = null;
+    try { audioBuffer = p.audio_base64 ? Buffer.from(p.audio_base64, 'base64') : null; } catch { /* bad base64 */ }
+    // A turn needs either audio or text (text = opening greeting trigger).
+    if (!audioBuffer && !(p.text && String(p.text).trim())) {
+      this._respond(data.requestId, { transcript: '', reply: '', audio_base64: null, mime: null });
+      return;
+    }
+    const out = await runWebcallTurn(this.engine, {
+      userId: p.userId || 'web_anonymous',
+      audioBuffer,
+      mime: p.mime || 'audio/webm',
+      language: p.language || null,
+      text: p.text || null,
+    });
+    this._respond(data.requestId, out);
   }
 
   // ─── Telnyx voice handling ───────────────────────────────────
@@ -200,8 +229,8 @@ Bad (will NOT work):
   // the turn and respond with plain spoken text (formatForVoice strips markdown).
   async _handleTelnyxChat(data) {
     const body = data.payload || {};
-    const { userId, content, language } = extractTelnyxEvent(body);
-    const text = await runVoiceTurn(this.engine, { userId, content, language });
+    const { userId, content, language, isGreeting } = extractTelnyxEvent(body);
+    const text = await runVoiceTurn(this.engine, { userId, content, language, isGreeting });
     this._respond(data.requestId, { content: text, model: body.model || 'aaas' });
   }
 

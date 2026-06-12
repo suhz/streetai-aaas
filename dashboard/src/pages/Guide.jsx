@@ -386,7 +386,42 @@ You can pre-populate data through:
 | \`run_query\` | Execute raw SQL queries (admin mode only) |
 | \`list_tables\` | Show all SQLite tables and their structure |
 
-These tools are available automatically — you don't need to configure them.`,
+These tools are available automatically — you don't need to configure them.
+
+### Keeping data fresh (Data Sources)
+
+For data that changes regularly — prices, stock, doctor schedules, daily menus — connect a **data source** that pulls a CSV (or JSON) from the business's own system on a schedule and writes it into \`data/\` (a JSON file, or a SQLite table). The agent reads the refreshed data live, with no restart.
+
+Add a \`.aaas/data-sources.json\` file (entirely opt-in — no file means no change):
+
+\`\`\`json
+{
+  "sources": [
+    {
+      "name": "products",
+      "type": "url",
+      "location": "https://docs.google.com/.../pub?output=csv",
+      "format": "csv",
+      "target": "sqlite",
+      "table": "products",
+      "mode": "replace",
+      "mapping": { "Item Name": "name", "Price": "price" },
+      "interval_minutes": 15
+    }
+  ]
+}
+\`\`\`
+
+- **type** — \`url\` (a published Google Sheet or an export endpoint) or \`folder\` (a local / cloud-synced path).
+- **target** — \`sqlite\` for large or frequently-changing catalogs, \`json\` for small sets.
+- **mode** — \`replace\` (rebuild from the full export, the default) or \`upsert\` (merge by \`key\`).
+- **mapping** — optional; rename source columns to field names. Unmapped columns pass through.
+- **interval_minutes** — refresh cadence (default 15).
+- **auth** — for secured URLs: \`{ "type": "bearer", "apiKey": "{{ENV_VAR}}" }\` — use \`{{ENV_VAR}}\` so secrets stay out of the file.
+
+While the agent is running, due sources refresh automatically (every 15 minutes by default). Run one immediately with \`aaas data sync\` (all) or \`aaas data sync <name>\` (one). Writes are atomic, so the agent always reads a complete snapshot.
+
+**Simplest setup:** keep the data in a Google Sheet, choose *File → Share → Publish to web → CSV*, and use that link as a \`url\` source — staff can edit from anywhere. If the business has a real API instead, use an **Extension** for live reads and write-back.`,
   },
   {
     id: 'protocol',

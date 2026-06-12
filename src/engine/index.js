@@ -13,6 +13,7 @@ import { buildBasePrompt } from './base-prompt.js';
 import { saveTransactionView } from './tools/workspace.js';
 import { maybeSeedTransactionFields } from './tools/transaction-view-seed.js';
 import { loadPending, removeAction } from './scheduler.js';
+import { syncDueDataSources } from '../datasync/index.js';
 import { loadConnection, saveConnection } from '../auth/connections.js';
 import crypto from 'crypto';
 
@@ -49,6 +50,7 @@ export class AgentEngine {
     // they don't keep the process alive past their natural exit.
     this._schedulerTimer = null;
     this._schedulerTickInFlight = false;
+    this._dataSyncInFlight = false;
   }
 
   /**
@@ -62,10 +64,25 @@ export class AgentEngine {
     // Catch-up sweep on start: anything overdue fires immediately, marked
     // `late: true` so the agent can word the reply accordingly.
     this._scheduledTick().catch(() => { /* non-fatal */ });
+    this._dataSyncTick(); // refresh data sources on the daemon (due-checked)
     this._schedulerTimer = setInterval(() => {
       this._scheduledTick().catch(() => { /* non-fatal */ });
+      this._dataSyncTick();
     }, intervalMs);
     if (this._schedulerTimer.unref) this._schedulerTimer.unref();
+  }
+
+  /**
+   * Best-effort data-source refresh on the daemon. Cheap: syncDueDataSources
+   * only fetches sources past their interval, and a re-entrancy guard prevents
+   * overlap if a sync runs longer than the tick. No data sources → no-op.
+   */
+  _dataSyncTick() {
+    if (this._dataSyncInFlight) return;
+    this._dataSyncInFlight = true;
+    syncDueDataSources(this.workspace)
+      .catch(() => { /* non-fatal */ })
+      .finally(() => { this._dataSyncInFlight = false; });
   }
 
   stopScheduler() {
@@ -337,6 +354,7 @@ export class AgentEngine {
       event: content,
       agentName: this.agentName,
       platformContext: platformContext || undefined,
+      replyLanguage: metadata?.replyLanguage,
     });
 
     // Debug: log full context sent to LLM
@@ -665,7 +683,7 @@ export class AgentEngine {
    * Compress session in the background if it's getting large.
    */
   _maybeCompress(platform, userId) {
-    const threshold = this.config.context?.sessionCompressAt || 4000;
+    const threshold = this.config.context?.sessionCompressAt || 10000;
     const session = this.sessionManager.getSession(platform, userId);
     const totalTokens = session.messages.reduce(
       (sum, m) => sum + estimateTokens(m.content || ''), 0

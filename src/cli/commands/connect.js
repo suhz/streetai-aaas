@@ -52,6 +52,7 @@ export async function connectCommand(platform, opts) {
     case 'slack': return connectSlack(ws, opts);
     case 'whatsapp': return connectWhatsApp(ws, opts);
     case 'telnyx': return connectTelnyx(ws, opts);
+    case 'webcall': return connectWebcall(ws, opts);
     case 'relay': return connectRelay(ws, opts);
   }
 }
@@ -687,6 +688,69 @@ async function connectTelnyx(ws, opts) {
     console.log(chalk.gray('  In the assistant: enable "Use Custom LLM" and "forward_metadata", set the'));
     console.log(chalk.gray('  greeting, STT (e.g. deepgram/nova-3), TTS voice and language, then assign'));
     console.log(chalk.gray('  your Telnyx phone number.\n'));
+    rl.close();
+  } catch (err) {
+    console.error(chalk.red(`\n  Error: ${err.message}\n`));
+    rl.close();
+  }
+}
+
+async function connectWebcall(ws, opts) {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const ask = (q) => new Promise((resolve) => rl.question(q, resolve));
+
+  try {
+    console.log(chalk.blue('\n  Connect Voice Call\n'));
+    console.log(chalk.gray('  Callers talk to the agent in the browser. This agent does speech-to-text'));
+    console.log(chalk.gray('  and text-to-speech on your own Groq key (Settings → Voice).\n'));
+
+    const relayBase = opts.baseUrl || 'https://streetai.org';
+    const relayConn = loadConnection(ws, 'relay');
+    let embedUrl;
+
+    if (relayConn?.slug && relayConn?.relayKey) {
+      // Relay (production) mode — streetai.org fronts the public endpoint.
+      console.log(chalk.gray('  Enabling Voice Call on the relay...'));
+      const r = await fetch(`${relayBase}/relay/configure`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ slug: relayConn.slug, relayKey: relayConn.relayKey, webcall: { enabled: true } }),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        console.error(chalk.red(`\n  Relay configure failed: ${err.error || r.status}\n`));
+        rl.close();
+        return;
+      }
+      saveConnection(ws, 'webcall', {
+        platform: 'webcall', mode: 'relay', slug: relayConn.slug,
+        connectedAt: new Date().toISOString(),
+      });
+      embedUrl = `${relayBase.replace(/\/$/, '')}/webcall/${relayConn.slug}/turn`;
+      console.log(chalk.green('\n  ✓ Enabled via relay. Saved to .aaas/connections/webcall.json\n'));
+    } else {
+      // Direct (prototype) mode — this workspace serves the endpoint itself.
+      const port = parseInt(opts.port) || 3303;
+      let publicUrl = opts.publicUrl || '';
+      if (!publicUrl) {
+        console.log(chalk.gray('  No relay connection found — using direct mode.'));
+        console.log(chalk.gray('  The browser must reach this endpoint over a public URL (a tunnel or a'));
+        console.log(chalk.gray('  host with a public IP).\n'));
+        publicUrl = (await ask(`  Public URL (blank = http://localhost:${port}): `)).trim();
+      }
+      saveConnection(ws, 'webcall', {
+        platform: 'webcall', mode: 'direct', port,
+        publicUrl: publicUrl || '', connectedAt: new Date().toISOString(),
+      });
+      const host = publicUrl ? publicUrl.replace(/\/$/, '') : `http://localhost:${port}`;
+      embedUrl = `${host}/webcall/turn`;
+      console.log(chalk.green('\n  ✓ Saved to .aaas/connections/webcall.json (direct mode)\n'));
+    }
+
+    console.log(chalk.bold('  Voice Call endpoint (POST audio here):\n'));
+    console.log(`    ${embedUrl}\n`);
+    console.log(chalk.gray('  Make sure Voice (text-to-speech) is enabled in Settings → Voice, and that'));
+    console.log(chalk.gray('  the agent is running/online so callers can reach it.\n'));
     rl.close();
   } catch (err) {
     console.error(chalk.red(`\n  Error: ${err.message}\n`));

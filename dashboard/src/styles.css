@@ -1955,7 +1955,7 @@ select.input {
   grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
   gap: 16px;
 }
-.deploy-card { transition: border-color 0.2s; }
+.deploy-card { transition: border-color 0.2s; min-width: 0; }
 .deploy-active { border-color: var(--green); }
 .deploy-error-border { border-color: var(--red); }
 .deploy-unavailable { opacity: 0.6; }
@@ -2149,10 +2149,10 @@ select.input {
   line-height: 1.5;
 }
 /* ═══ Deploy Profile Card (Truuze) ═══ */
-.deploy-profile-card { min-width: 320px; }
+.deploy-profile-card { min-width: 0; }
 .deploy-profile {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 14px;
   margin-bottom: 14px;
 }

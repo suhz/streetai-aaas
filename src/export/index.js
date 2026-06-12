@@ -363,3 +363,160 @@ function copyTree(src, dst, { skipDirNames = new Set() } = {}) {
   }
   // Symlinks and other special files: skipped (unlikely in AaaS workspaces).
 }
+
+// ── Non-destructive update ────────────────────────────────
+//
+// Apply a published bundle's *definition* onto an existing workspace while
+// preserving the client's runtime state. Unlike importWorkspace (create/replace),
+// this never wipes sessions, credentials, connections, transactions, memory, or
+// accumulated data. Used by `aaas update` and the idempotent installer.
+
+// Paths (relative to workspace root, forward-slashed) that are 100% client-owned
+// runtime/secret state and must never be overwritten or deleted by an update.
+const UPDATE_PRESERVE_PREFIXES = [
+  '.aaas/sessions/', '.aaas/connections/', '.aaas/payments/', '.aaas/backups/',
+  'transactions/',
+];
+const UPDATE_PRESERVE_EXACT = new Set([
+  '.aaas/credentials.json', '.aaas/notifications.json', '.aaas/agent.pid', '.aaas/agent.log',
+]);
+
+/** Decide how a bundle file should be applied to the client workspace. */
+function classifyUpdatePath(rel) {
+  const p = rel.replace(/\\/g, '/');
+  if (UPDATE_PRESERVE_EXACT.has(p)) return 'preserve';
+  if (UPDATE_PRESERVE_PREFIXES.some((pre) => p.startsWith(pre))) return 'preserve';
+  if (p === '.aaas/config.json') return 'config';
+  if (p === 'extensions/registry.json') return 'registry';
+  if (p.startsWith('data/') || p.startsWith('memory/')) return 'additive';
+  return 'overwrite';
+}
+
+/** List all files under `root`, returned as forward-slashed relative paths. */
+function listFilesRel(root) {
+  const out = [];
+  const walk = (dir, rel) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const r = rel ? `${rel}/${entry.name}` : entry.name;
+      const abs = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(abs, r);
+      else if (entry.isFile()) out.push(r);
+    }
+  };
+  walk(root, '');
+  return out;
+}
+
+function isPlainObject(v) { return v && typeof v === 'object' && !Array.isArray(v); }
+
+/** Deep-merge `bundle` and `client`; the CLIENT wins on every conflict, the
+ *  bundle only contributes keys the client doesn't already have. */
+function deepMergePreferClient(bundle, client) {
+  if (!isPlainObject(bundle) || !isPlainObject(client)) return client !== undefined ? client : bundle;
+  const out = { ...bundle };
+  for (const k of Object.keys(client)) {
+    out[k] = (isPlainObject(bundle[k]) && isPlainObject(client[k]))
+      ? deepMergePreferClient(bundle[k], client[k])
+      : client[k];
+  }
+  return out;
+}
+
+/** Merge extension registries: take the bundle's definitions but keep the
+ *  client's existing apiKey values; keep client-only extensions; report which
+ *  bundle extensions are new (so the caller can flag any that need a key). */
+function mergeExtensionsRegistry(bundleReg, clientReg) {
+  const getExts = (r) => (Array.isArray(r) ? r : (r && Array.isArray(r.extensions) ? r.extensions : []));
+  const bundleExts = getExts(bundleReg);
+  const clientExts = getExts(clientReg);
+  const clientByName = new Map(clientExts.map((e) => [e.name, e]));
+  const bundleNames = new Set(bundleExts.map((e) => e.name));
+  const newExtensions = [];
+  const mergedExts = bundleExts.map((be) => {
+    const ce = clientByName.get(be.name);
+    if (ce && ce.apiKey) return { ...be, apiKey: ce.apiKey }; // preserve the client's secret
+    if (!ce) newExtensions.push(be.name);
+    return be;
+  });
+  for (const ce of clientExts) if (!bundleNames.has(ce.name)) mergedExts.push(ce); // keep client-only
+  const merged = Array.isArray(bundleReg) ? mergedExts : { ...(bundleReg || {}), extensions: mergedExts };
+  return { merged, newExtensions };
+}
+
+/**
+ * Apply `archivePath` onto an existing `workspaceRoot` non-destructively.
+ * Backs up every file it changes to `.aaas/backups/update-<ts>/` first (unless
+ * `backup:false`). With `dryRun:true`, writes nothing — only reports.
+ *
+ * @returns {Promise<{ workspaceRoot, manifest, updated[], merged[], added[],
+ *   skipped[], newExtensions[], backupDir }>}
+ */
+export async function applyUpdate(archivePath, workspaceRoot, { backup = true, dryRun = false } = {}) {
+  const manifest = await readManifest(archivePath); // throws on bad/incompatible bundle
+  const wsAbs = path.resolve(workspaceRoot);
+  if (!fs.existsSync(path.join(wsAbs, '.aaas'))) {
+    throw new Error(`Not an AaaS workspace (no .aaas/): ${wsAbs}`);
+  }
+
+  const staging = fs.mkdtempSync(path.join(os.tmpdir(), 'aaas-update-'));
+  const summary = { updated: [], merged: [], added: [], skipped: [], newExtensions: [], backupDir: null };
+  try {
+    await tar.x({ file: archivePath, cwd: staging });
+    const stagedWs = path.join(staging, 'workspace');
+    if (!fs.existsSync(stagedWs)) {
+      throw new Error('Archive is missing the workspace/ tree — bundle may be corrupt.');
+    }
+
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const backupDir = path.join(wsAbs, '.aaas', 'backups', `update-${ts}`);
+    const backupExisting = (dst) => {
+      if (!backup || dryRun || !fs.existsSync(dst)) return;
+      if (!summary.backupDir) { fs.mkdirSync(backupDir, { recursive: true }); summary.backupDir = backupDir; }
+      const bdst = path.join(backupDir, path.relative(wsAbs, dst));
+      fs.mkdirSync(path.dirname(bdst), { recursive: true });
+      fs.copyFileSync(dst, bdst);
+    };
+
+    for (const rel of listFilesRel(stagedWs)) {
+      const cls = classifyUpdatePath(rel);
+      const src = path.join(stagedWs, rel);
+      const dst = path.join(wsAbs, rel);
+
+      if (cls === 'preserve') { summary.skipped.push(rel); continue; }
+
+      if (cls === 'additive') {
+        if (fs.existsSync(dst)) { summary.skipped.push(rel); continue; } // never overwrite client files
+        if (!dryRun) { fs.mkdirSync(path.dirname(dst), { recursive: true }); fs.copyFileSync(src, dst); }
+        summary.added.push(rel);
+        continue;
+      }
+
+      if (cls === 'config') {
+        if (!dryRun) {
+          backupExisting(dst);
+          writeJson(dst, deepMergePreferClient(readJson(src) || {}, readJson(dst) || {}));
+        }
+        summary.merged.push(rel);
+        continue;
+      }
+
+      if (cls === 'registry') {
+        if (!dryRun) {
+          backupExisting(dst);
+          const { merged, newExtensions } = mergeExtensionsRegistry(readJson(src), readJson(dst));
+          writeJson(dst, merged);
+          summary.newExtensions.push(...newExtensions);
+        }
+        summary.merged.push(rel);
+        continue;
+      }
+
+      // overwrite (publisher definition: skills/, SOUL.md, extensions code, data-sources.json, …)
+      if (!dryRun) { backupExisting(dst); fs.mkdirSync(path.dirname(dst), { recursive: true }); fs.copyFileSync(src, dst); }
+      summary.updated.push(rel);
+    }
+  } finally {
+    try { fs.rmSync(staging, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+  return { workspaceRoot: wsAbs, manifest, ...summary };
+}

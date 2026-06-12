@@ -1,13 +1,15 @@
 import express from 'express';
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import { fileURLToPath } from 'url';
 import { spawn } from 'child_process';
 import chalk from 'chalk';
 import { apiRouter } from './api.js';
-import { autoStartConnectors } from './connector-control.js';
+import { autoStartConnectors, daemonRunning } from './connector-control.js';
 import { hubRouter } from './hub.js';
 import { getValidWorkspaces } from '../utils/registry.js';
+import { syncDueDataSources } from '../datasync/index.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -140,29 +142,109 @@ export async function startServer(workspace, port, hubDir, openPath = '/') {
   // Bring up any connectors flagged to start with the dashboard. Per-workspace,
   // per-connector, opt-in; skips anything already running or owned by a daemon.
   // Best-effort and fully isolated so it can never delay or fail server boot.
-  async function autoStartAll() {
-    let workspaces;
-    try { workspaces = getValidWorkspaces(); } catch { return; }
-    for (const w of workspaces) {
-      try {
-        const results = await autoStartConnectors(w.path);
-        for (const r of results) {
-          if (r.ok && !r.skipped) {
-            console.log(chalk.green(`  Auto-started ${r.platform} for ${path.basename(w.path)}`));
-          } else if (r.error) {
-            console.log(chalk.yellow(`  Auto-start ${r.platform} (${path.basename(w.path)}) failed: ${r.error}`));
-          }
+  // Backoff schedule (ms after the previous pass) for retrying connectors that
+  // failed to auto-start. Connectors whose connect() does a remote handshake
+  // (e.g. Truuze's profile check + WebSocket) can fail transiently at boot when
+  // the network/API isn't ready yet; a one-shot start would leave them down.
+  const AUTO_START_RETRY_DELAYS = [10_000, 30_000, 60_000];
+
+  // Auto-start one workspace's flagged connectors; log results. Returns true if
+  // any connector failed (ok:false) and is thus worth retrying. Never throws —
+  // autoStartConnectors is best-effort and skips connected/daemon-owned ones, so
+  // calling this again is a safe, idempotent retry of only what's still down.
+  async function autoStartWorkspace(w) {
+    try {
+      const results = await autoStartConnectors(w.path);
+      let failed = false;
+      for (const r of results) {
+        if (r.ok && !r.skipped) {
+          console.log(chalk.green(`  Auto-started ${r.platform} for ${path.basename(w.path)}`));
+        } else if (r.error) {
+          failed = true;
+          console.log(chalk.yellow(`  Auto-start ${r.platform} (${path.basename(w.path)}) failed: ${r.error}`));
         }
-      } catch (e) {
-        console.log(chalk.yellow(`  Auto-start skipped for ${path.basename(w.path)}: ${e.message}`));
       }
+      return failed;
+    } catch (e) {
+      console.log(chalk.yellow(`  Auto-start skipped for ${path.basename(w.path)}: ${e.message}`));
+      return false;
     }
   }
 
+  // Retry the workspaces that had a connector failure, with backoff. Each pass
+  // re-runs autoStartWorkspace (which only re-attempts connectors still down),
+  // then recurses with whichever workspaces are still failing. Best-effort.
+  function scheduleAutoStartRetries(workspaces, attempt = 0) {
+    if (!workspaces.length || attempt >= AUTO_START_RETRY_DELAYS.length) return;
+    const t = setTimeout(async () => {
+      console.log(chalk.gray(`  Retrying auto-start (attempt ${attempt + 1}/${AUTO_START_RETRY_DELAYS.length}) for ${workspaces.length} workspace(s)…`));
+      const stillFailing = [];
+      for (const w of workspaces) {
+        if (await autoStartWorkspace(w)) stillFailing.push(w);
+      }
+      scheduleAutoStartRetries(stillFailing, attempt + 1);
+    }, AUTO_START_RETRY_DELAYS[attempt]);
+    if (t.unref) t.unref(); // don't keep the process alive just for a retry timer
+  }
+
+  async function autoStartAll() {
+    let workspaces;
+    try { workspaces = getValidWorkspaces(); } catch { return; }
+    const failed = [];
+    for (const w of workspaces) {
+      if (await autoStartWorkspace(w)) failed.push(w);
+    }
+    if (failed.length) scheduleAutoStartRetries(failed, 0);
+  }
+
+  // Refresh configured data sources (CSV/JSON from url/folder) on a timer, so
+  // the agent's data stays current. Mirrors autoStartAll: per-workspace,
+  // best-effort, isolated, and skips workspaces a daemon owns (the daemon syncs
+  // those). A workspace with no data-sources.json is a no-op. Re-entrancy guard
+  // skips a tick if the previous run is still going.
+  let dataSyncing = false;
+  async function syncAllDataSources() {
+    if (dataSyncing) return;
+    dataSyncing = true;
+    try {
+      let workspaces;
+      try { workspaces = getValidWorkspaces(); } catch { return; }
+      for (const w of workspaces) {
+        try {
+          if (daemonRunning(w.path)) continue;
+          const results = await syncDueDataSources(w.path);
+          for (const r of results) {
+            if (r.synced) console.log(chalk.green(`  Synced data source "${r.name}" for ${path.basename(w.path)} (${r.rows} rows → ${r.target})`));
+            else if (r.error) console.log(chalk.yellow(`  Data source "${r.name}" (${path.basename(w.path)}) failed: ${r.error}`));
+          }
+        } catch { /* one workspace can't break the loop */ }
+      }
+    } finally {
+      dataSyncing = false;
+    }
+  }
+  const DATA_SYNC_TICK_MS = 15 * 60 * 1000; // 15 minutes
+
   const server = app.listen(port, () => {
+    // Record this dashboard's PID + port so external tools (e.g. the updater
+    // in install.ps1) can find and stop the exact process to apply an update.
+    // Written only here, after a successful listen — the EADDRINUSE re-launch
+    // path never touches it. Removed on clean exit.
+    try {
+      const pidFile = path.join(os.homedir(), '.aaas', 'dashboard.pid');
+      fs.mkdirSync(path.dirname(pidFile), { recursive: true });
+      fs.writeFileSync(pidFile, JSON.stringify({ pid: process.pid, port, startedAt: new Date().toISOString() }));
+      const cleanupPid = () => { try { fs.unlinkSync(pidFile); } catch { /* ignore */ } };
+      process.on('exit', cleanupPid);
+      process.on('SIGINT', () => { cleanupPid(); process.exit(0); });
+      process.on('SIGTERM', () => { cleanupPid(); process.exit(0); });
+    } catch { /* pid file is best-effort */ }
+
     console.log(chalk.green(`  Dashboard running at ${chalk.bold(url)}\n`));
     openBrowserDetached(openUrl);
     autoStartAll();
+    syncAllDataSources();                              // catch-up at boot
+    setInterval(syncAllDataSources, DATA_SYNC_TICK_MS); // then every 15 min
   });
 
   // If the port is already taken, check whether it's our own dashboard. If

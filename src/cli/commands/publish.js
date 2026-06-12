@@ -92,6 +92,9 @@ export async function publishCommand(agentName, options = {}) {
   console.log(chalk.bold('  Send this link to the client:'));
   console.log('    ' + chalk.cyan(data.setupUrl));
   console.log('');
+  console.log(chalk.gray('  New client → installs. Existing client → updates in place'));
+  console.log(chalk.gray('  (keeps their sessions, data, and credentials). Same link either way.'));
+  console.log('');
   console.log(chalk.gray(`  Business: ${business}`));
   console.log(chalk.gray(`  Expires:  ${new Date(data.expiresAt).toLocaleString()}`));
   if (!noSecrets) {
