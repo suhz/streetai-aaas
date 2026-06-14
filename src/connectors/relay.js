@@ -5,6 +5,7 @@ import { BaseConnector } from './index.js';
 import { extractFiles, readFileBuffer } from './media.js';
 import { loadConnection } from '../auth/connections.js';
 import { writePlatformSkill, readJson } from '../utils/workspace.js';
+import { logError } from '../utils/errlog.js';
 import { formatForWhatsApp } from './whatsapp.js';
 import { extractTelnyxEvent, runVoiceTurn } from './telnyx.js';
 import { runWebcallTurn } from './webcall.js';
@@ -308,7 +309,10 @@ Bad (will NOT work):
                   if (attempt < 3) await new Promise(r => setTimeout(r, 2000));
                 }
               }
-              if (!sent) console.error('[relay:wa] All 3 send attempts failed — response lost');
+              if (!sent) {
+                console.error('[relay:wa] All 3 send attempts failed — response lost');
+                logError(this.engine?.workspace, 'connector:whatsapp', 'All 3 WhatsApp send attempts failed — response lost', { to: '[redacted]' });
+              }
             }
           } catch (err) {
             console.error('[relay:wa] Processing error:', err.message);
@@ -787,6 +791,7 @@ Bad (will NOT work):
     if (this.reconnectAttempts >= 10) {
       this.status = 'error';
       this.error = 'Relay connection lost after 10 attempts';
+      logError(this.engine?.workspace, 'connector:relay', 'Relay connection lost — gave up after 10 reconnect attempts');
       return;
     }
 

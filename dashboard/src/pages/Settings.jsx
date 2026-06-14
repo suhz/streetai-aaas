@@ -623,6 +623,9 @@ export default function Settings() {
         {/* Storage cleanup */}
         <StorageCleanupCard />
 
+        {/* Diagnostics — locate & send the error log */}
+        <DiagnosticsCard />
+
         {/* Navigation — per-workspace setting, hidden at hub root since
             the hub sidebar uses its own nav config (not workspaceNav). */}
         {workspace && (
@@ -981,6 +984,86 @@ const CLEANUP_RANGES = [
  * attached to an order/booking. Picking a range auto-previews; deleting still
  * requires an explicit confirm.
  */
+function DiagnosticsCard() {
+  const api = useApi();
+  const [data, setData] = useState(null); // { path, exists, lines, size }
+  const [loading, setLoading] = useState(true);
+  const [copied, setCopied] = useState(false);
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      const r = await api.get('/api/diagnostics/error-log');
+      setData(r);
+    } catch {
+      setData(null);
+    }
+    setLoading(false);
+  };
+
+  useEffect(() => { load(); }, []);
+
+  const copyPath = async () => {
+    if (!data?.path) return;
+    try {
+      await navigator.clipboard.writeText(data.path);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch { /* clipboard may be unavailable */ }
+  };
+
+  return (
+    <div className="card">
+      <div className="card-header" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <span>Diagnostics</span>
+        <button className="btn" onClick={load} disabled={loading} style={{ fontSize: 12, padding: '2px 10px' }}>
+          {loading ? 'Loading…' : 'Refresh'}
+        </button>
+      </div>
+      <div className="card-body">
+        <p className="form-hint" style={{ marginTop: 0 }}>
+          If the agent misbehaves, send this error log for diagnosis. It records important
+          errors only and is automatically sanitized — no personal data, IDs, or secrets are stored.
+        </p>
+
+        <div className="form-group">
+          <label>Error log file</label>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginTop: 4 }}>
+            <code style={{
+              fontSize: 12, padding: '6px 10px', background: 'var(--bg-secondary)',
+              border: '1px solid var(--border)', borderRadius: 6, wordBreak: 'break-all', flex: '1 1 240px',
+            }}>
+              {data?.path || '—'}
+            </code>
+            <button className="btn" onClick={copyPath} disabled={!data?.path}>
+              {copied ? 'Copied ✓' : 'Copy path'}
+            </button>
+          </div>
+        </div>
+
+        {!loading && data && !data.exists && (
+          <p className="form-hint" style={{ margin: 0, color: 'var(--green)' }}>
+            No errors logged yet. ✅
+          </p>
+        )}
+
+        {!loading && data?.exists && (
+          <div className="form-group">
+            <label>Recent entries</label>
+            <pre style={{
+              maxHeight: 220, overflow: 'auto', fontSize: 11.5, lineHeight: 1.5,
+              padding: 10, margin: '4px 0 0', background: 'var(--bg-secondary)',
+              border: '1px solid var(--border)', borderRadius: 6, whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+            }}>
+              {data.lines || '(empty)'}
+            </pre>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function StorageCleanupCard() {
   const api = useApi();
   const [days, setDays] = useState(90);

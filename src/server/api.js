@@ -6,6 +6,7 @@ import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import multer from 'multer';
 import { getWorkspacePaths, readJson, readText, writeJson, listFiles, fileStats, formatBytes } from '../utils/workspace.js';
+import { readErrorLogTail } from '../utils/errlog.js';
 import { validateStatusTransition, TXN_STATUSES } from '../engine/tools/transactions.js';
 import { getProviderCredential, setProviderCredential, removeProviderCredential, listProviders, maskApiKey } from '../auth/credentials.js';
 import { listConnections, loadConnection, saveConnection, removeConnection } from '../auth/connections.js';
@@ -2067,6 +2068,12 @@ export function apiRouter(workspace) {
     // Return last 100 lines
     const lines = content.split('\n').slice(-100).join('\n');
     res.json({ log: lines });
+  });
+
+  // Diagnostics: the curated, sanitized error log the owner can locate & send.
+  router.get('/diagnostics/error-log', (req, res) => {
+    const tail = readErrorLogTail(workspace, 300);
+    res.json(tail);
   });
 
   // Get pending owner verification codes

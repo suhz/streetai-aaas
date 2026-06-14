@@ -15,6 +15,7 @@ import { maybeSeedTransactionFields } from './tools/transaction-view-seed.js';
 import { loadPending, removeAction } from './scheduler.js';
 import { syncDueDataSources } from '../datasync/index.js';
 import { loadConnection, saveConnection } from '../auth/connections.js';
+import { logError } from '../utils/errlog.js';
 import crypto from 'crypto';
 
 const MAX_TOOL_ROUNDS = 10;
@@ -193,6 +194,22 @@ export class AgentEngine {
    * @returns {{ response: string, toolsUsed: string[], tokensUsed: number }}
    */
   async processEvent(event) {
+    // Central error funnel: every connector reaches the agent through here, so
+    // wrapping this one method captures runtime turn failures (LLM/tool/etc.)
+    // for all agents in the curated error log, then re-throws so existing
+    // connector fallback behavior is unchanged.
+    try {
+      return await this._processEvent(event);
+    } catch (err) {
+      logError(this.workspace, 'engine', err, {
+        platform: event?.platform,
+        type: event?.type,
+      });
+      throw err;
+    }
+  }
+
+  async _processEvent(event) {
     if (!this.initialized) throw new Error('Engine not initialized. Call initialize() first.');
 
     const { platform, userId, userName, content, metadata } = event;

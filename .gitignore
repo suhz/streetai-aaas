@@ -29,6 +29,8 @@ the_clay_pot_restaurant/
 freshlane/
 archive_fitness/
 lifer_hospital/
+his-mock/
+lifer2_hospital/
 
 # Credentials and secrets
 .aaas/credentials.json
@@ -51,4 +53,5 @@ AaaS.txt
 CONTEXT.md
 TELNYX_VOICE_PLAN.md
 CLIENT_INSTALLER_PLAN.md
+PERSISTENCE-PLAN.md
 issues.txt

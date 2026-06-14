@@ -13,6 +13,9 @@ import path from 'path';
 import { AgentEngine } from '../engine/index.js';
 import { loadAllConnectors } from '../connectors/index.js';
 import { getProviderCredential } from '../auth/credentials.js';
+import { installGlobalErrorHandlers } from '../utils/errlog.js';
+
+installGlobalErrorHandlers();
 
 const workspace = process.argv[2];
 const platforms = process.argv.slice(3).filter(Boolean);

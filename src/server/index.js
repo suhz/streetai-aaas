@@ -10,6 +10,7 @@ import { autoStartConnectors, daemonRunning } from './connector-control.js';
 import { hubRouter } from './hub.js';
 import { getValidWorkspaces } from '../utils/registry.js';
 import { syncDueDataSources } from '../datasync/index.js';
+import { logError, installGlobalErrorHandlers } from '../utils/errlog.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -51,6 +52,9 @@ function openBrowserDetached(url) {
 }
 
 export async function startServer(workspace, port, hubDir, openPath = '/') {
+  // Capture hard process crashes in the curated error log (preserves crash
+  // semantics: uncaughtException still exits so a supervisor can restart).
+  installGlobalErrorHandlers();
   const app = express();
   const isHub = !workspace;
 
@@ -162,11 +166,13 @@ export async function startServer(workspace, port, hubDir, openPath = '/') {
         } else if (r.error) {
           failed = true;
           console.log(chalk.yellow(`  Auto-start ${r.platform} (${path.basename(w.path)}) failed: ${r.error}`));
+          logError(w.path, `autostart:${r.platform}`, r.error);
         }
       }
       return failed;
     } catch (e) {
       console.log(chalk.yellow(`  Auto-start skipped for ${path.basename(w.path)}: ${e.message}`));
+      logError(w.path, 'autostart', e);
       return false;
     }
   }
